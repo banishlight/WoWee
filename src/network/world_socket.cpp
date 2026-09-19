@@ -149,54 +149,11 @@ bool WorldSocket::connect(const std::string& host, uint16_t port) {
     sockfd = net::openResolvedSocket(host, port, serverAddr);
     if (sockfd == INVALID_SOCK) return false;
 
-    int result = ::connect(sockfd, (struct sockaddr*)&serverAddr, sizeof(serverAddr));
-    if (result < 0) {
-        int err = net::lastError();
-        if (!net::isInProgress(err)) {
-            LOG_ERROR("Failed to connect: ", net::errorString(err));
-            net::closeSocket(sockfd);
-            sockfd = INVALID_SOCK;
-            return false;
-        }
-
-        // Non-blocking connect in progress - wait up to 10s for completion.
-        // On Windows, calling recv() before the connect completes returns
-        // WSAENOTCONN; we must poll writability before declaring connected.
-        fd_set writefds, errfds;
-        FD_ZERO(&writefds);
-        FD_ZERO(&errfds);
-        FD_SET(sockfd, &writefds);
-        FD_SET(sockfd, &errfds);
-
-        struct timeval tv;
-        tv.tv_sec  = 10;
-        tv.tv_usec = 0;
-
-        int sel = ::select(static_cast<int>(sockfd) + 1, nullptr, &writefds, &errfds, &tv);
-        if (sel <= 0) {
-            LOG_ERROR("World server connection timed out (", host, ":", port, ")");
-            net::closeSocket(sockfd);
-            sockfd = INVALID_SOCK;
-            return false;
-        }
-
-        // Verify the socket error code - writeable doesn't guarantee success on all platforms
-        int sockErr = 0;
-        socklen_t errLen = sizeof(sockErr);
-        getsockopt(sockfd, SOL_SOCKET, SO_ERROR,
-                   reinterpret_cast<char*>(&sockErr), &errLen);
-        if (sockErr != 0) {
-            LOG_ERROR("Failed to connect to world server: ", net::errorString(sockErr));
-            net::closeSocket(sockfd);
-            sockfd = INVALID_SOCK;
-            return false;
-        }
+    if (!net::connectSocket(sockfd, serverAddr, 10,
+                            "world server " + host + ":" + std::to_string(port))) {
+        sockfd = INVALID_SOCK;
+        return false;
     }
-
-    // Disable Nagle's algorithm - send small packets immediately.
-    int one = 1;
-    setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY,
-               reinterpret_cast<const char*>(&one), sizeof(one));
 
     connected = true;
     LOG_INFO("Connected to world server: ", host, ":", port);

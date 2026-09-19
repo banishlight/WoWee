@@ -22,49 +22,10 @@ bool TCPSocket::connect(const std::string& host, uint16_t port) {
     sockfd = net::openResolvedSocket(host, port, serverAddr);
     if (sockfd == INVALID_SOCK) return false;
 
-    int result = ::connect(sockfd, (struct sockaddr*)&serverAddr, sizeof(serverAddr));
-    if (result < 0) {
-        int err = net::lastError();
-        if (!net::isInProgress(err)) {
-            LOG_ERROR("Failed to connect: ", net::errorString(err));
-            net::closeSocket(sockfd);
-            sockfd = INVALID_SOCK;
-            return false;
-        }
-
-        // Non-blocking connect in progress - wait for it to complete
-        fd_set writefds;
-        FD_ZERO(&writefds);
-        FD_SET(sockfd, &writefds);
-
-        struct timeval tv;
-        tv.tv_sec = 5;
-        tv.tv_usec = 0;
-
-        int selectResult = ::select(static_cast<int>(sockfd) + 1, nullptr, &writefds, nullptr, &tv);
-        if (selectResult <= 0) {
-            LOG_ERROR("Connection timed out to ", host, ":", port);
-            net::closeSocket(sockfd);
-            sockfd = INVALID_SOCK;
-            return false;
-        }
-
-        // Check if the connection actually succeeded
-        int sockErr = 0;
-        socklen_t errLen = sizeof(sockErr);
-        getsockopt(sockfd, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&sockErr), &errLen);
-        if (sockErr != 0) {
-            LOG_ERROR("Connection failed: ", net::errorString(sockErr));
-            net::closeSocket(sockfd);
-            sockfd = INVALID_SOCK;
-            return false;
-        }
+    if (!net::connectSocket(sockfd, serverAddr, 5, host + ":" + std::to_string(port))) {
+        sockfd = INVALID_SOCK;
+        return false;
     }
-
-    // Disable Nagle's algorithm - send small packets immediately.
-    int one = 1;
-    setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY,
-               reinterpret_cast<const char*>(&one), sizeof(one));
 
     connected = true;
     LOG_INFO("Connected to ", host, ":", port);

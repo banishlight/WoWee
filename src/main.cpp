@@ -14,6 +14,9 @@
 #include <SDL2/SDL.h>
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
+#include <atomic>
+#include <thread>
+#include "platform/web_data.hpp"
 #endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -249,20 +252,34 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char* argv[]) {
         // The page owns the loop. main has to return for the browser to draw
         // anything, so the application outlives it on the heap and each
         // animation frame runs one iteration of the loop run() would have.
-        auto* webApp = new wowee::core::Application();
-        if (!webApp->initialize()) {
-            LOG_FATAL("Failed to initialize application");
-            return 1;
-        }
-        webApp->startRun();
-        emscripten_set_main_loop_arg([](void* arg) {
-            auto* a = static_cast<wowee::core::Application*>(arg);
-            if (!a->runFrame()) {
+        //
+        // The game data is mounted first, on a worker - it cannot be set up
+        // from the main thread (see web_data.cpp) - and the frames wait for it
+        // before the application starts.
+        static std::atomic<bool> dataReady{false};
+        std::thread([] {
+            if (!wowee::platform::mountWebData())
+                LOG_WARNING("Starting without game data from the server");
+            dataReady.store(true, std::memory_order_release);
+        }).detach();
+        emscripten_set_main_loop([] {
+            static wowee::core::Application* app = nullptr;
+            if (!app) {
+                if (!dataReady.load(std::memory_order_acquire)) return;
+                app = new wowee::core::Application();
+                if (!app->initialize()) {
+                    LOG_FATAL("Failed to initialize application");
+                    emscripten_cancel_main_loop();
+                    return;
+                }
+                app->startRun();
+            }
+            if (!app->runFrame()) {
                 emscripten_cancel_main_loop();
-                a->shutdown();
+                app->shutdown();
                 LOG_INFO("Application exited successfully");
             }
-        }, webApp, 0, false);
+        }, 0, false);
         return 0;
 #else
         wowee::core::Application app;

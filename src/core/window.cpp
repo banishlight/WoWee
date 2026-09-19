@@ -1,4 +1,5 @@
 #include "core/window.hpp"
+#include "platform/drawable_size.hpp"
 
 #include <algorithm>
 
@@ -132,7 +133,13 @@ bool Window::initialize() {
         }
     }
 #endif
+#ifdef __EMSCRIPTEN__
+    // No Vulkan library to load: the vk* calls are the WebGPU translation
+    // layer linked into the client (src/platform/webgpu).
+    const bool vulkanLoaded = true;
+#else
     bool vulkanLoaded = (SDL_Vulkan_LoadLibrary(nullptr) == 0);
+#endif
 #ifdef _WIN32
     if (!vulkanLoaded) {
         const char* sysRoot = std::getenv("SystemRoot");
@@ -159,7 +166,11 @@ bool Window::initialize() {
     }
 
     // Create Vulkan window (no GL attributes needed)
+#ifdef __EMSCRIPTEN__
+    Uint32 flags = SDL_WINDOW_SHOWN;
+#else
     Uint32 flags = SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN;
+#endif
 #ifdef __APPLE__
     // Draw at the display's own pixels rather than at its points.
     //
@@ -283,7 +294,9 @@ void Window::shutdown() {
     }
 
     LOG_DEBUG("Window::shutdown - SDL_Quit...");
+#ifndef __EMSCRIPTEN__
     SDL_Vulkan_UnloadLibrary();
+#endif
     SDL_Quit();
     LOG_DEBUG("Window shutdown complete");
 }
@@ -327,7 +340,7 @@ void Window::setVsync(bool enable) {
 void Window::refreshDrawableSize() {
     if (!window) { drawableWidth = width; drawableHeight = height; return; }
     int dw = 0, dh = 0;
-    SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
+    platform::drawableSize(window, &dw, &dh);
     // A minimised window answers zero, and a swapchain of zero is a spec
     // violation - so the last good size stands until there is a real one.
     if (dw > 0 && dh > 0) {

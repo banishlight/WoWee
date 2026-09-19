@@ -3,6 +3,7 @@
 #include <thread>
 #include <mutex>
 #include "rendering/vk_context.hpp"
+#include "platform/drawable_size.hpp"
 
 #include <fstream>
 #include "rendering/vk_utils.hpp"
@@ -93,7 +94,7 @@ bool VkContext::initialize(SDL_Window* window) {
     createPipelineCache();
 
     int w, h;
-    SDL_Vulkan_GetDrawableSize(window, &w, &h);
+    platform::drawableSize(window, &w, &h);
     if (!createSwapchain(w, h)) return false;
 
     if (!createCommandPools()) return false;
@@ -376,6 +377,17 @@ VkSampler VkContext::getOrCreateSampler(const VkSamplerCreateInfo& info) {
 }
 
 bool VkContext::createInstance(SDL_Window* window) {
+#ifdef __EMSCRIPTEN__
+    // The browser: SDL has no Vulkan here, and vkGetInstanceProcAddr is the
+    // WebGPU translation layer's, linked in rather than loaded. The canvas is
+    // a "headless" surface - the one surface extension that asks nothing of
+    // the window system - so vk-bootstrap is told not to look for another.
+    (void)window;
+    std::vector<const char*> sdlExts = {VK_KHR_SURFACE_EXTENSION_NAME,
+                                        VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME};
+    vkb::InstanceBuilder builder{vkGetInstanceProcAddr};
+    builder.set_headless(true);
+#else
     // Get required SDL extensions
     unsigned int sdlExtCount = 0;
     SDL_Vulkan_GetInstanceExtensions(window, &sdlExtCount, nullptr);
@@ -383,6 +395,7 @@ bool VkContext::createInstance(SDL_Window* window) {
     SDL_Vulkan_GetInstanceExtensions(window, &sdlExtCount, sdlExts.data());
 
     vkb::InstanceBuilder builder;
+#endif
     builder.set_app_name("Wowee")
            .set_app_version(VK_MAKE_VERSION(1, 0, 0))
            .require_api_version(1, 2, 0)
@@ -444,6 +457,15 @@ bool VkContext::createInstance(SDL_Window* window) {
 }
 
 bool VkContext::createSurface(SDL_Window* window) {
+#ifdef __EMSCRIPTEN__
+    (void)window;
+    VkHeadlessSurfaceCreateInfoEXT info{VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT};
+    if (vkCreateHeadlessSurfaceEXT(instance, &info, nullptr, &surface) != VK_SUCCESS) {
+        LOG_ERROR("Failed to create the canvas surface");
+        return false;
+    }
+    return true;
+#endif
     if (!SDL_Vulkan_CreateSurface(window, instance, &surface)) {
         LOG_ERROR("Failed to create Vulkan surface: ", SDL_GetError());
         return false;

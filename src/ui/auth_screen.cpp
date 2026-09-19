@@ -223,6 +223,29 @@ void AuthScreen::setPort(int value) {
 }
 
 void AuthScreen::render(auth::AuthHandler& authHandler) {
+#ifdef __EMSCRIPTEN__
+    // Debug, browser build: wowee.html?autologin=user:pass@host[:port] fills
+    // the card and logs in once, so a headless test run gets past this screen.
+    if (static bool autoTried = false; !autoTried && loginInfoLoaded) {
+        autoTried = true;
+        if (const char* spec = std::getenv("WOWEE_AUTOLOGIN")) {
+            const std::string s(spec);
+            const auto colon = s.find(':'), at = s.rfind('@');
+            if (colon != std::string::npos && at != std::string::npos && colon < at) {
+                username_.setText(s.substr(0, colon));
+                password_.setText(s.substr(colon + 1, at - colon - 1));
+                std::string host = s.substr(at + 1);
+                if (const auto pc = host.rfind(':'); pc != std::string::npos) {
+                    setPort(std::atoi(host.c_str() + pc + 1));
+                    host.resize(pc);
+                }
+                hostname_.setText(host);
+                usingStoredHash = false;
+                attemptAuth(authHandler);
+            }
+        }
+    }
+#endif
     // Load saved login info on first render
     if (!loginInfoLoaded) {
         loadLoginInfo();

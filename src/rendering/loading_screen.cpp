@@ -1,4 +1,5 @@
 #include "rendering/loading_screen.hpp"
+#include "platform/drawable_size.hpp"
 
 #include <SDL2/SDL_vulkan.h>
 #include "rendering/vk_context.hpp"
@@ -432,7 +433,7 @@ void LoadingScreen::render() {
             // on a high density display rebuilding at those halves the
             // swapchain under a loading screen that is drawn full width.
             int w = 0, h = 0;
-            SDL_Vulkan_GetDrawableSize(sdlWindow, &w, &h);
+            platform::drawableSize(sdlWindow, &w, &h);
             if (w > 0 && h > 0) {
                 (void)vkCtx->recreateSwapchain(w, h);
             }

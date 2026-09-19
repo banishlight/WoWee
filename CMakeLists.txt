@@ -1450,25 +1450,79 @@ if(UNIX AND NOT APPLE AND NOT ANDROID AND NOT EMSCRIPTEN)
     target_link_libraries(wowee PRIVATE X11)
 endif()
 if(EMSCRIPTEN)
-    # Emits wowee.html + wowee.js + wowee.wasm.
+    # The Vulkan the renderer calls, implemented on WebGPU. See wgpu_layer.hpp.
+    target_sources(wowee PRIVATE
+        src/platform/web_data.cpp
+        src/platform/web_socket.cpp
+        src/platform/webgpu/capture.cpp
+        src/platform/webgpu/commands.cpp
+        src/platform/webgpu/device.cpp
+        src/platform/webgpu/formats.cpp
+        src/platform/webgpu/pipeline.cpp
+        src/platform/webgpu/proc_addr.cpp
+        src/platform/webgpu/replay.cpp
+        src/platform/webgpu/resources.cpp
+    )
+    target_compile_options(wowee PRIVATE --use-port=emdawnwebgpu)
+
+    # The shaders, translated to WGSL beside the SPIR-V the renderer loads.
+    # Needs glslc, spirv-opt and naga on the build machine; see the script.
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    find_program(WOWEE_GLSLC glslc REQUIRED)
+    find_program(WOWEE_SPIRV_OPT spirv-opt REQUIRED)
+    find_program(WOWEE_NAGA naga HINTS "$ENV{HOME}/.cargo/bin" "$ENV{HOME}/.local/bin" REQUIRED)
+    set(WOWEE_WASM_SHADER_DIR ${CMAKE_BINARY_DIR}/shaders)
+    file(GLOB WOWEE_WASM_SHADER_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/assets/shaders/*.glsl)
+    add_custom_command(
+        OUTPUT ${WOWEE_WASM_SHADER_DIR}/manifest.json
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/wasm_shaders.py
+            --src ${CMAKE_CURRENT_SOURCE_DIR}/assets/shaders
+            --out ${WOWEE_WASM_SHADER_DIR}
+            --glslc ${WOWEE_GLSLC} --spirv-opt ${WOWEE_SPIRV_OPT} --naga ${WOWEE_NAGA}
+            --imgui ${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp
+        DEPENDS ${WOWEE_WASM_SHADER_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/tools/wasm_shaders.py
+        COMMENT "Translating shaders to WGSL"
+        VERBATIM
+    )
+    add_custom_target(wowee_wasm_shaders DEPENDS ${WOWEE_WASM_SHADER_DIR}/manifest.json)
+    add_dependencies(wowee wowee_wasm_shaders)
+
+    # Emits wowee.html + wowee.js + wowee.wasm + wowee.data.
     set_target_properties(wowee PROPERTIES SUFFIX ".html")
     target_link_options(wowee PRIVATE
+        --use-port=emdawnwebgpu
+        "--pre-js=${CMAKE_CURRENT_SOURCE_DIR}/src/platform/webgpu/webgpu_pre.js"
         -sALLOW_MEMORY_GROWTH=1
         -sMAXIMUM_MEMORY=4GB
         -sSTACK_SIZE=8MB
-        -sPTHREAD_POOL_SIZE=8
-        # The interface's shaders, fonts and art, and the repo's Data/ (the
-        # expansion profiles and opcode tables), packed into wowee.data and
-        # mounted where the native client finds them beside the executable.
-        # The music is 73 MB of assets/ and is left for streaming.
+        # Workers made before main runs. One made later needs the main thread
+        # to get back to the browser first, and a main thread waiting on that
+        # very thread (the world load waits on its terrain workers) never
+        # does. With the core count capped at eight (webgpu_pre.js) the
+        # client's pools come to about twenty threads.
+        -sPTHREAD_POOL_SIZE=32
+        # And when they are all in use, fail the thread's creation instead of
+        # waiting for a new worker - which, with the main thread the one
+        # waiting, is a silent hang. A thrown system_error names where.
+        -sPTHREAD_POOL_SIZE_STRICT=2
+        # WasmFS, for /Data: the game data is fetched from the server a file
+        # at a time as it is first read (src/platform/web_data.cpp).
+        -sWASMFS
+        -sFORCE_FILESYSTEM
+        # The WebSocket API the network sockets are built on (web_socket.cpp).
+        -lwebsocket.js
+        # The interface's fonts and art and the staged shaders, packed into
+        # wowee.data and mounted where the native client finds them beside the
+        # executable. The music is 73 MB of assets/ and is left for streaming;
+        # the source shaders are replaced by the staged ones.
         "--preload-file=${CMAKE_CURRENT_SOURCE_DIR}/assets@/assets"
-        "--preload-file=${CMAKE_CURRENT_SOURCE_DIR}/Data@/Data"
+        "--preload-file=${WOWEE_WASM_SHADER_DIR}@/assets/shaders"
         "--exclude-file=*/Original Music/*"
-        # Temporary: the vk* entry points have no implementation yet. Until the
-        # WebGPU translation layer provides them, a call aborts at runtime
-        # instead of failing the link.
-        -sERROR_ON_UNDEFINED_SYMBOLS=0
+        "--exclude-file=${CMAKE_CURRENT_SOURCE_DIR}/assets/shaders/*"
     )
+    set_property(TARGET wowee APPEND PROPERTY LINK_DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/webgpu/webgpu_pre.js
+        ${WOWEE_WASM_SHADER_DIR}/manifest.json)
 endif()
 if(APPLE)
     target_link_libraries(wowee PRIVATE "-framework Foundation")

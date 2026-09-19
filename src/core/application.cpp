@@ -1,4 +1,5 @@
 #include "core/application.hpp"
+#include "platform/drawable_size.hpp"
 #include "core/env_flag.hpp"
 #include "core/character_paths.hpp"
 #include "ui/settings_schema.hpp"
@@ -1405,7 +1406,7 @@ bool Application::runFrame() {
                 // Pixels: a surface is built at the drawable size, which
                 // is not the window size on a high density display.
                 int w = 0, h = 0;
-                SDL_Vulkan_GetDrawableSize(window->getSDLWindow(), &w, &h);
+                platform::drawableSize(window->getSDLWindow(), &w, &h);
                 if (!window->getVkContext()->restoreSurface(
                         window->getSDLWindow(), w, h)) {
                     LOG_ERROR("Resuming without a surface; the client cannot draw");

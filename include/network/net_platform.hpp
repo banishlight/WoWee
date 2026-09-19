@@ -61,9 +61,28 @@ inline void ensureInit() {
 inline void ensureInit() {}
 #endif
 
+#ifdef __EMSCRIPTEN__
+// ---- The browser (src/platform/web_socket.cpp) ----
+//
+// A browser cannot open a TCP connection, only a WebSocket. Each socket here
+// is one, to the relay tools/serve-wasm.py runs beside the page, which opens
+// the TCP connection to the game server and passes bytes both ways. The
+// handles are small integers like a descriptor, so the socket classes above
+// this do not know the difference.
+socket_t webOpen(const std::string& host, uint16_t port);
+bool webConnect(socket_t s, const std::string& what);
+void webClose(socket_t s);
+ssize_t webSend(socket_t s, const uint8_t* data, size_t len);
+ssize_t webRecv(socket_t s, uint8_t* buf, size_t len);
+#endif
+
 // ---- Portable helpers ----
 
 inline void closeSocket(socket_t s) {
+#ifdef __EMSCRIPTEN__
+    webClose(s);
+    return;
+#endif
 #ifdef _WIN32
     closesocket(s);
 #else
@@ -72,7 +91,10 @@ inline void closeSocket(socket_t s) {
 }
 
 inline bool setNonBlocking(socket_t s) {
-#ifdef _WIN32
+#ifdef __EMSCRIPTEN__
+    (void)s;
+    return true;   // always, in the browser
+#elif defined(_WIN32)
     u_long mode = 1;
     return ioctlsocket(s, FIONBIO, &mode) == 0;
 #else
@@ -133,10 +155,16 @@ inline const char* errorString(int err) {
 
 // Portable send - Windows recv/send take char*, not void*.
 inline ssize_t portableSend(socket_t s, const uint8_t* data, size_t len) {
+#ifdef __EMSCRIPTEN__
+    return webSend(s, data, len);
+#endif
     return ::send(s, reinterpret_cast<const char*>(data), static_cast<int>(len), 0);
 }
 
 inline ssize_t portableRecv(socket_t s, uint8_t* buf, size_t len) {
+#ifdef __EMSCRIPTEN__
+    return webRecv(s, buf, len);
+#endif
     return ::recv(s, reinterpret_cast<char*>(buf), static_cast<int>(len), 0);
 }
 
@@ -149,6 +177,11 @@ inline ssize_t portableRecv(socket_t s, uint8_t* buf, size_t len) {
 /// between them. It was written out twice, down to the log lines.
 inline socket_t openResolvedSocket(const std::string& host, uint16_t port,
                                    struct sockaddr_in& addr) {
+#ifdef __EMSCRIPTEN__
+    // No resolving here: the relay does it, and the browser could not.
+    memset(&addr, 0, sizeof(addr));
+    return webOpen(host, port);
+#endif
     socket_t fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd == INVALID_SOCK) {
         LOG_ERROR("Failed to create socket");
@@ -172,6 +205,61 @@ inline socket_t openResolvedSocket(const std::string& host, uint16_t port,
     addr.sin_port = htons(port);
     freeaddrinfo(res);
     return fd;
+}
+
+/// Connect a socket from openResolvedSocket, waiting up to timeoutSec for the
+/// non-blocking connect to finish, and turn off Nagle's algorithm. On failure
+/// the socket is closed and the reason logged; `what` names the peer in it.
+///
+/// TCPSocket and WorldSocket each wrote this out, differing only in the
+/// timeout and the log line.
+inline bool connectSocket(socket_t fd, const sockaddr_in& addr, int timeoutSec,
+                          const std::string& what) {
+#ifdef __EMSCRIPTEN__
+    (void)addr;
+    (void)timeoutSec;
+    return webConnect(fd, what);
+#endif
+    int result = ::connect(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
+    if (result < 0) {
+        int err = lastError();
+        if (!isInProgress(err)) {
+            LOG_ERROR("Failed to connect to ", what, ": ", errorString(err));
+            closeSocket(fd);
+            return false;
+        }
+
+        // Wait for the connect to complete. On Windows, calling recv() before
+        // it does returns WSAENOTCONN, so writability has to be polled first.
+        fd_set writefds, errfds;
+        FD_ZERO(&writefds);
+        FD_ZERO(&errfds);
+        FD_SET(fd, &writefds);
+        FD_SET(fd, &errfds);
+        struct timeval tv;
+        tv.tv_sec = timeoutSec;
+        tv.tv_usec = 0;
+        if (::select(static_cast<int>(fd) + 1, nullptr, &writefds, &errfds, &tv) <= 0) {
+            LOG_ERROR("Connection timed out (", what, ")");
+            closeSocket(fd);
+            return false;
+        }
+
+        // Writable does not mean connected on every platform.
+        int sockErr = 0;
+        socklen_t errLen = sizeof(sockErr);
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&sockErr), &errLen);
+        if (sockErr != 0) {
+            LOG_ERROR("Failed to connect to ", what, ": ", errorString(sockErr));
+            closeSocket(fd);
+            return false;
+        }
+    }
+
+    // Send small packets immediately.
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
+    return true;
 }
 
 } // namespace net

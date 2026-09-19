@@ -1,4 +1,5 @@
 #include "ui/character_screen.hpp"
+#include <cstdlib>
 #include "game/equipment_hash.hpp"
 #include "ui/ui_colors.hpp"
 #include "rendering/character_preview.hpp"
@@ -256,6 +257,17 @@ void CharacterScreen::render(game::GameHandler& gameHandler) {
             enterWorld(characters[static_cast<size_t>(selectedCharacterIndex)]);
         }
     }
+
+#ifdef __EMSCRIPTEN__
+    // Debug, browser build: wowee.html?enterworld enters with the character
+    // select restored (the last one played), once, for headless test runs.
+    if (static bool autoEntered = false; !autoEntered && restoredLastCharacter &&
+        std::getenv("WOWEE_AUTO_ENTER") && selectedCharacterIndex >= 0 &&
+        selectedCharacterIndex < static_cast<int>(characters.size())) {
+        autoEntered = true;
+        enterWorld(characters[static_cast<size_t>(selectedCharacterIndex)]);
+    }
+#endif
 
     const bool haveSelection = selectedCharacterIndex >= 0 &&
                                selectedCharacterIndex < static_cast<int>(characters.size());
