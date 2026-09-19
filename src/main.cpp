@@ -14,9 +14,9 @@
 #include <SDL2/SDL.h>
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
-#include <atomic>
-#include <thread>
+#include <memory>
 #include "platform/web_data.hpp"
+#include "platform/web_frame.hpp"
 #endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -249,37 +249,31 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char* argv[]) {
         wowee::core::migratePortableConfigIfNeeded();
 
 #ifdef __EMSCRIPTEN__
-        // The page owns the loop. main has to return for the browser to draw
-        // anything, so the application outlives it on the heap and each
-        // animation frame runs one iteration of the loop run() would have.
+        // The loop is the native one, with the browser given its turn after
+        // every frame - by the frame itself when it presents
+        // (Window::swapBuffers), here when it did not. See web_frame.cpp.
         //
-        // The game data is mounted first, on a worker - it cannot be set up
-        // from the main thread (see web_data.cpp) - and the frames wait for it
-        // before the application starts.
-        static std::atomic<bool> dataReady{false};
-        std::thread([] {
-            if (!wowee::platform::mountWebData())
-                LOG_WARNING("Starting without game data from the server");
-            dataReady.store(true, std::memory_order_release);
-        }).detach();
-        emscripten_set_main_loop([] {
-            static wowee::core::Application* app = nullptr;
-            if (!app) {
-                if (!dataReady.load(std::memory_order_acquire)) return;
-                app = new wowee::core::Application();
-                if (!app->initialize()) {
-                    LOG_FATAL("Failed to initialize application");
-                    emscripten_cancel_main_loop();
-                    return;
-                }
-                app->startRun();
-            }
-            if (!app->runFrame()) {
-                emscripten_cancel_main_loop();
-                app->shutdown();
-                LOG_INFO("Application exited successfully");
-            }
-        }, 0, false);
+        // SDL_Delay stays a plain sleep: left to itself it would suspend too,
+        // and the worker threads that call it cannot.
+        SDL_SetHint(SDL_HINT_EMSCRIPTEN_ASYNCIFY, "0");
+
+        if (!wowee::platform::mountWebData())
+            LOG_WARNING("Starting without game data from the server");
+
+        auto app = std::make_unique<wowee::core::Application>();
+        if (!app->initialize()) {
+            LOG_FATAL("Failed to initialize application");
+            return 1;
+        }
+        app->startRun();
+        for (;;) {
+            const uint64_t yielded = wowee::platform::framesYielded();
+            if (!app->runFrame()) break;
+            if (wowee::platform::framesYielded() == yielded)
+                wowee::platform::yieldFrame();
+        }
+        app->shutdown();
+        LOG_INFO("Application exited successfully");
         return 0;
 #else
         wowee::core::Application app;

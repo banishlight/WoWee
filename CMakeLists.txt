@@ -1453,6 +1453,7 @@ if(EMSCRIPTEN)
     # The Vulkan the renderer calls, implemented on WebGPU. See wgpu_layer.hpp.
     target_sources(wowee PRIVATE
         src/platform/web_data.cpp
+        src/platform/web_frame.cpp
         src/platform/web_socket.cpp
         src/platform/webgpu/capture.cpp
         src/platform/webgpu/commands.cpp
@@ -1497,6 +1498,9 @@ if(EMSCRIPTEN)
         -sALLOW_MEMORY_GROWTH=1
         -sMAXIMUM_MEMORY=4GB
         -sSTACK_SIZE=8MB
+        # Lets the main thread suspend mid-call and give the browser its turn
+        # - how the world load shows its loading screen (web_frame.cpp).
+        -sJSPI
         # Workers made before main runs. One made later needs the main thread
         # to get back to the browser first, and a main thread waiting on that
         # very thread (the world load waits on its terrain workers) never

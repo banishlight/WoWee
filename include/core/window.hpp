@@ -4,6 +4,9 @@
 #include <memory>
 #include <SDL2/SDL.h>
 #include <vulkan/vulkan.h>
+#ifdef __EMSCRIPTEN__
+#include "platform/web_frame.hpp"
+#endif
 
 namespace wowee {
 namespace rendering { class VkContext; }
@@ -36,7 +39,13 @@ private:
 
 public:
 
-    void swapBuffers() {} // No-op: Vulkan presents in Renderer::endFrame()
+    // Vulkan presents in Renderer::endFrame(). In the browser the frame only
+    // reaches the screen once the browser gets its turn, so this gives it one.
+#ifdef __EMSCRIPTEN__
+    void swapBuffers() { platform::yieldFrame(); }
+#else
+    void swapBuffers() {}
+#endif
 
     [[nodiscard]] bool shouldClose() const { return shouldCloseFlag; }
     void setShouldClose(bool value) { shouldCloseFlag = value; }
