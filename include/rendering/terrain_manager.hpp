@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/byte_size.hpp"
 #include "core/coordinates.hpp"
 #include "pipeline/adt_loader.hpp"
 #include "pipeline/terrain_mesh.hpp"
@@ -475,7 +476,7 @@ private:
     // THREAD-SAFE: protected by tileCacheMutex_.
     std::unordered_map<TileCoord, CachedTile, TileCoord::Hash> tileCache_;
     std::list<TileCoord> tileCacheLru_;
-    size_t tileCacheBudgetBytes_ = 8ull * 1024 * 1024 * 1024; // Dynamic, set at init based on RAM
+    size_t tileCacheBudgetBytes_ = mbToBytes(8192); // Dynamic, set at init based on RAM
     std::mutex tileCacheMutex_;
 
     std::shared_ptr<PendingTile> getCachedTile(const TileCoord& coord);

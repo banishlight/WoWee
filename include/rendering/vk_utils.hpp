@@ -8,6 +8,7 @@
 #include <limits>
 #include <cstdlib>
 
+#include "core/byte_size.hpp"
 #include "core/env_flag.hpp"
 
 namespace wowee {

@@ -1,6 +1,7 @@
 #include "pipeline/asset_manager.hpp"
 #include "pipeline/base_fallback.hpp"
 #include "pipeline/dds_loader.hpp"
+#include "core/byte_size.hpp"
 #include "core/logger.hpp"
 #include "core/memory_monitor.hpp"
 #include "core/profiler.hpp"
@@ -126,15 +127,20 @@ void AssetManager::setupFileCacheBudget() {
     // 8 GB was handing this cache 840 MB, which is both more than the app may
     // hold and a good way to be killed the moment it goes to the background.
     const size_t defaultMaxBudgetBytes = 384ull * 1024ull * 1024ull;
+#elif defined(__EMSCRIPTEN__)
+    // The cache lives in the wasm heap, which also holds everything else the
+    // client allocates and cannot pass 4 GB. Half of what is free would hand
+    // this one cache most of it.
+    const size_t defaultMaxBudgetBytes = 1024ull * 1024ull * 1024ull;
 #else
-    const size_t defaultMaxBudgetBytes = 12288ull * 1024ull * 1024ull;  // 12 GB max for file cache
+    const size_t defaultMaxBudgetBytes = mbToBytes(12288);  // 12 GB max for file cache
 #endif
     const size_t maxBudgetBytes = (envMaxMB > 0)
-        ? (envMaxMB * 1024ull * 1024ull)
+        ? mbToBytes(envMaxMB)
         : defaultMaxBudgetBytes;
 
     if (envFixedMB > 0) {
-        fileCacheBudget = envFixedMB * 1024ull * 1024ull;
+        fileCacheBudget = mbToBytes(envFixedMB);
         if (fileCacheBudget < minBudgetBytes) {
             fileCacheBudget = minBudgetBytes;
         }

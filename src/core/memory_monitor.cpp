@@ -1,10 +1,14 @@
 #include "core/memory_monitor.hpp"
 #include "core/logger.hpp"
+#include "core/byte_size.hpp"
 #include <fstream>
 #include <string>
 #include <sstream>
 #ifdef _WIN32
 #include <windows.h>
+#elif defined(__EMSCRIPTEN__)
+#include <emscripten/heap.h>
+#include <malloc.h>
 #elif defined(__APPLE__)
 #include <mach/mach.h>
 #include <sys/types.h>
@@ -16,7 +20,7 @@
 namespace wowee {
 namespace core {
 
-#if !defined(_WIN32) && !defined(__APPLE__)
+#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__EMSCRIPTEN__)
 namespace {
 size_t readMemAvailableBytesFromProc() {
     std::ifstream meminfo("/proc/meminfo");
@@ -36,7 +40,7 @@ size_t readMemAvailableBytesFromProc() {
     return 0;
 }
 } // namespace
-#endif // !_WIN32 && !__APPLE__
+#endif // !_WIN32 && !__APPLE__ && !__EMSCRIPTEN__
 
 MemoryMonitor& MemoryMonitor::getInstance() {
     static MemoryMonitor instance;
@@ -47,7 +51,7 @@ void MemoryMonitor::initialize() {
     constexpr size_t kOneGB = 1024ull * 1024 * 1024;
     // Fallback if OS API unavailable - 16 GB is a safe conservative estimate
     // that prevents over-aggressive asset caching on unknown hardware.
-    constexpr size_t kFallbackRAM = 16 * kOneGB;
+    constexpr size_t kFallbackRAM = mbToBytes(16 * 1024);
 
 #ifdef _WIN32
     ULONGLONG totalKB = 0;
@@ -58,6 +62,12 @@ void MemoryMonitor::initialize() {
         totalRAM_ = kFallbackRAM;
         LOG_WARNING("Could not detect system RAM, assuming 16GB");
     }
+#elif defined(__EMSCRIPTEN__)
+    // The machine's RAM is not ours to size caches against. Everything the
+    // client allocates lives in one wasm heap, which grows up to a limit set at
+    // link time (-sMAXIMUM_MEMORY) and can never exceed 4 GB on wasm32.
+    totalRAM_ = emscripten_get_heap_max();
+    LOG_INFO("Wasm heap limit: ", totalRAM_ / (1024 * 1024), " MB");
 #elif defined(__APPLE__)
     int64_t physmem = 0;
     size_t len = sizeof(physmem);
@@ -88,6 +98,11 @@ size_t MemoryMonitor::getAvailableRAM() const {
         return static_cast<size_t>(status.ullAvailPhys);
     }
     return totalRAM_ / 2;
+#elif defined(__EMSCRIPTEN__)
+    // What the heap can still hand out: its limit less what malloc holds.
+    // Freed blocks stay inside the heap, so this counts them as available.
+    const size_t inUse = static_cast<size_t>(mallinfo().uordblks);
+    return inUse < totalRAM_ ? totalRAM_ - inUse : 0;
 #elif defined(__APPLE__)
     // hw.usermem is a 32-bit kernel sysctl on macOS: on systems with ≥16 GB RAM
     // the value overflows signed int32, truncating to ~2 GB and causing false
@@ -132,22 +147,22 @@ size_t MemoryMonitor::getAvailableRAM() const {
 size_t MemoryMonitor::getRecommendedCacheBudget() const {
     size_t available = getAvailableRAM();
     // Use 50% of available RAM for caches, hard-capped at 16 GB.
-    static constexpr size_t kHardCapBytes = 16ull * 1024 * 1024 * 1024;  // 16 GB
-    size_t budget = available * 50 / 100;
+    static constexpr size_t kHardCapBytes = mbToBytes(16 * 1024);  // 16 GB
+    size_t budget = available / 2;
     return budget < kHardCapBytes ? budget : kHardCapBytes;
 }
 
 bool MemoryMonitor::isMemoryPressure() const {
     size_t available = getAvailableRAM();
     // Memory pressure if < 10% RAM available
-    return available < (totalRAM_ * 10 / 100);
+    return available < (totalRAM_ / 100 * 10);
 }
 
 bool MemoryMonitor::isSevereMemoryPressure() const {
     size_t available = getAvailableRAM();
     // Severe pressure if < 15% RAM available - background workers should
     // pause entirely to avoid OOM-killing other applications.
-    return available < (totalRAM_ * 15 / 100);
+    return available < (totalRAM_ / 100 * 15);
 }
 
 } // namespace core
