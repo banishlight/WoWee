@@ -99,10 +99,15 @@ size_t MemoryMonitor::getAvailableRAM() const {
     }
     return totalRAM_ / 2;
 #elif defined(__EMSCRIPTEN__)
-    // What the heap can still hand out: its limit less what malloc holds.
-    // Freed blocks stay inside the heap, so this counts them as available.
-    const size_t inUse = static_cast<size_t>(mallinfo().uordblks);
-    return inUse < totalRAM_ ? totalRAM_ - inUse : 0;
+    // What the heap can still grow by. Freed blocks inside it are not counted,
+    // so this reads low once the client has been at its peak - which is the
+    // safe direction, and it is the only cheap measure there is.
+    //
+    // Not mallinfo(): it walks every block in the heap, holding the one
+    // allocator lock the whole time. At a 2 GB heap that is seconds, with
+    // every thread that allocates stopped behind it, which is a freeze.
+    const size_t heap = emscripten_get_heap_size();
+    return heap < totalRAM_ ? totalRAM_ - heap : 0;
 #elif defined(__APPLE__)
     // hw.usermem is a 32-bit kernel sysctl on macOS: on systems with ≥16 GB RAM
     // the value overflows signed int32, truncating to ~2 GB and causing false
