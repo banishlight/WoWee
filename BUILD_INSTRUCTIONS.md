@@ -274,17 +274,18 @@ You can also specify an expansion: `.\extract_assets.ps1 "C:\Games\WoW\Data" wot
 
 ## 🌐 WebAssembly (experimental)
 
-The client compiles to WebAssembly with Emscripten and starts in a browser.
-It does not draw yet: the browser has no Vulkan, and the WebGPU layer that will
-provide the `vk*` calls is not written. Until it is, startup stops at window
-creation.
+The client compiles to WebAssembly with Emscripten and runs in a browser with
+WebGPU (Chrome/Edge 113+). The renderer is unchanged: its Vulkan calls are
+implemented on WebGPU by `src/platform/webgpu`, and its shaders are translated
+to WGSL at build time by `tools/wasm_shaders.py`.
 
 ```bash
-# Once: the Emscripten SDK, and OpenSSL built for wasm32
+# Once: the Emscripten SDK, OpenSSL built for wasm32, and naga for the shaders
 git clone https://github.com/emscripten-core/emsdk.git ~/emsdk
 ~/emsdk/emsdk install latest && ~/emsdk/emsdk activate latest
 source ~/emsdk/emsdk_env.sh
 tools/build-wasm-deps.sh
+cargo install naga-cli     # plus glslc and spirv-opt from the Vulkan SDK / your distro
 
 # Build
 emcmake cmake -S . -B build-wasm -G Ninja -DCMAKE_BUILD_TYPE=Release \
@@ -295,6 +296,21 @@ cmake --build build-wasm --target wowee
 # Run: serves with the headers that worker threads need
 tools/serve-wasm.py
 # then open http://localhost:8080/wowee.html
+```
+
+How the port works, how to test it headlessly, and what is left: `docs/plan-web.md`.
+
+Two page parameters help when debugging the port:
+
+- `?capture=N` logs frame N as a PNG, base64-encoded on one `WOWEE_CAPTURE`
+  console line.
+- `?offscreen` renders to textures instead of the canvas. Headless Chromium
+  loses the WebGPU device on the first canvas draw, so automated runs need it:
+
+```bash
+chromium --headless=new --enable-unsafe-webgpu --enable-logging=stderr \
+    'http://localhost:8080/wowee.html?offscreen&capture=60' 2>&1 |
+  grep -o 'WOWEE_CAPTURE [A-Za-z0-9+/=]*' | cut -d' ' -f2 | base64 -d > frame.png
 ```
 
 ---
