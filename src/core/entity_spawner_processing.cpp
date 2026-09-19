@@ -1,4 +1,5 @@
 #include "core/entity_spawner.hpp"
+#include "core/thread_pool.hpp"
 
 #include <set>
 #include "rendering/m2_model_classifier.hpp"
@@ -505,7 +506,7 @@ void EntitySpawner::processCreatureSpawnQueue(bool unlimited) {
             }
 
             AsyncCreatureLoad load;
-            load.future = std::async(std::launch::async,
+            load.future = core::ThreadPool::loadWorkers().submit(
                 [am, m2Path, modelId, s, skinPaths = std::move(displaySkinPaths)]() -> PreparedCreatureModel {
                     PreparedCreatureModel result;
                     result.guid = s.guid;
@@ -790,7 +791,7 @@ void EntitySpawner::processDeferredEquipmentQueue() {
     auto displayInfoIds = equipData.first;
     auto inventoryTypes = equipData.second;
     AsyncEquipmentLoad load;
-    load.future = std::async(std::launch::async,
+    load.future = core::ThreadPool::loadWorkers().submit(
         [am, guid, displayInfoIds, inventoryTypes, paths = std::move(texturePaths)]() -> PreparedEquipmentUpdate {
             PreparedEquipmentUpdate result;
             result.guid = guid;
@@ -976,7 +977,7 @@ void EntitySpawner::processGameObjectSpawnQueue() {
             PendingGameObjectSpawn capture = s;
             std::string capturePath = modelPath;
             AsyncGameObjectLoad load;
-            load.future = std::async(std::launch::async,
+            load.future = core::ThreadPool::loadWorkers().submit(
                 [am, capture, capturePath]() -> PreparedGameObjectWMO {
                     PreparedGameObjectWMO result;
                     result.guid = capture.guid;

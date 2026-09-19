@@ -61,6 +61,23 @@ public:
         return pool;
     }
 
+    // Model and texture preparation for things coming into view: creatures,
+    // equipment, game objects. These were a std::async each - a thread per
+    // model, a dozen at once when a crowd spawns - and in the browser, where a
+    // thread is a Web Worker from a fixed pool, that many exhausted the pool
+    // and deadlocked the main thread waiting on one that could not start.
+    static ThreadPool& loadWorkers() {
+        static ThreadPool pool(4);
+        return pool;
+    }
+
+    // Slow CPU work nothing waits on: normal-map generation, which used to be
+    // a detached thread per texture.
+    static ThreadPool& backgroundWorkers() {
+        static ThreadPool pool(2);
+        return pool;
+    }
+
     // Schedule fn on a worker thread. The returned future carries fn's result
     // or any exception it threw (same semantics as std::async).
     template <typename F>

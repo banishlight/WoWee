@@ -1,4 +1,5 @@
 #include "core/entity_spawner.hpp"
+#include "core/thread_pool.hpp"
 #include "rendering/m2_model_classifier.hpp"
 #include "core/appearance_composer.hpp"
 #include "pipeline/char_sections.hpp"
@@ -1827,7 +1828,7 @@ void EntitySpawner::applyCreatureDisplayTextures(uint32_t displayId, uint32_t mo
             // (in processAsyncNpcCompositeResults).
             auto* am = assetManager_;
             AsyncNpcCompositeLoad load;
-            load.future = std::async(std::launch::async,
+            load.future = core::ThreadPool::loadWorkers().submit(
                 [am, extraCopy, skinSlots = std::move(skinSlots),
                  hairSlots = std::move(hairSlots), modelId, displayId, isHdCharacterModel]() mutable -> PreparedNpcComposite {
                     PreparedNpcComposite result;

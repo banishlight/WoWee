@@ -763,7 +763,7 @@ bool CharacterRenderer::queueNormalMapGeneration(const std::string& cacheKey,
     // shutdown() to see 0 and proceed while a thread is still running).
     pendingNormalMapCount_.fetch_add(1, std::memory_order_acq_rel);
     auto* self = this;
-    std::thread([self, ck = cacheKey, px = std::move(pixels), width, height]() mutable {
+    core::ThreadPool::backgroundWorkers().submit([self, ck = cacheKey, px = std::move(pixels), width, height]() mutable {
         // try-catch guarantees the counter is decremented even if the compute
         // throws (e.g., bad_alloc). Without this, shutdown() would deadlock
         // waiting for a count that never reaches zero.
@@ -780,7 +780,7 @@ bool CharacterRenderer::queueNormalMapGeneration(const std::string& cacheKey,
         if (self->pendingNormalMapCount_.fetch_sub(1, std::memory_order_release) == 1) {
             self->normalMapDoneCV_.notify_one();
         }
-    }).detach();
+    });
     return true;
 }
 
