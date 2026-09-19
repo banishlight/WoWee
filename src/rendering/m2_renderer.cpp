@@ -651,6 +651,7 @@ bool M2Renderer::initialize(VkContext* ctx, VkDescriptorSetLayout perFrameLayout
             // Slot 0: identity matrix (for non-animated instances)
             if (megaBoneMapped_[i]) {
                 memcpy(megaBoneMapped_[i], &identity, sizeof(identity));
+                vmaFlushAllocation(vkCtx_->getAllocator(), megaBoneAlloc_[i], 0, sizeof(identity));
             }
 
             megaBoneSet_[i] = allocateBoneSet();

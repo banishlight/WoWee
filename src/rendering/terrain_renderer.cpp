@@ -588,6 +588,16 @@ TerrainChunkGPU TerrainRenderer::uploadChunk(const pipeline::ChunkMesh& chunk) {
         // Copy indices
         auto* ibDst = static_cast<uint32_t*>(megaIBMapped_) + megaIBUsed_;
         std::memcpy(ibDst, chunk.indices.data(), idxCount * sizeof(uint32_t));
+        // Said written, for memory that is not host-coherent - where the GPU
+        // only sees what is flushed. Nothing on coherent memory, which is
+        // what VMA picks on desktop drivers; the browser build's translation
+        // layer offers large buffers only non-coherent memory, and uploads
+        // just these ranges instead of all 88 MB every frame.
+        VmaAllocator allocator = vkCtx->getAllocator();
+        vmaFlushAllocation(allocator, megaVBAlloc_, VkDeviceSize(megaVBUsed_) * sizeof(pipeline::TerrainVertex),
+                           VkDeviceSize(vertCount) * sizeof(pipeline::TerrainVertex));
+        vmaFlushAllocation(allocator, megaIBAlloc_, VkDeviceSize(megaIBUsed_) * sizeof(uint32_t),
+                           VkDeviceSize(idxCount) * sizeof(uint32_t));
 
         gpuChunk.megaBaseVertex = static_cast<int32_t>(megaVBUsed_);
         gpuChunk.megaFirstIndex = megaIBUsed_;

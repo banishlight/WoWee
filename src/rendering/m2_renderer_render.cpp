@@ -700,6 +700,8 @@ void M2Renderer::prepareRender(uint32_t frameIndex, const Camera& camera) {
     // all 300 matrices instead of being truncated into a fixed stride and
     // reading into its neighbour's range.
     uint32_t nextOffset = 1;
+    // The span of matrices written this frame, flushed in one call below.
+    uint32_t writtenLo = UINT32_MAX, writtenHi = 0;
     for (size_t idx : animatedInstanceIndices_) {
         if (idx >= instances.size()) continue;
         auto& instance = instances[idx];
@@ -773,11 +775,22 @@ void M2Renderer::prepareRender(uint32_t frameIndex, const Camera& camera) {
              instance.megaBoneUploadedSlot[frameIndex] != instance.megaBoneOffset)) {
             auto* dst = static_cast<glm::mat4*>(megaBoneMapped_[frameIndex]) + instance.megaBoneOffset;
             memcpy(dst, instance.boneMatrices.data(), boneCount * sizeof(glm::mat4));
+            writtenLo = std::min(writtenLo, instance.megaBoneOffset);
+            writtenHi = std::max(writtenHi, instance.megaBoneOffset + boneCount);
             instance.bonesDirty[frameIndex] = false;
             instance.megaBoneUploadedSlot[frameIndex] = instance.megaBoneOffset;
         }
 
         nextOffset += boneCount;
+    }
+
+    // Visible to the GPU on memory that is not host-coherent (see the same
+    // flush in TerrainRenderer::uploadChunk). One call for the whole span:
+    // the buffer is 32 MB and a frame writes a few hundred KB of it.
+    if (writtenHi > writtenLo) {
+        vmaFlushAllocation(vkCtx_->getAllocator(), megaBoneAlloc_[frameIndex],
+                           VkDeviceSize(writtenLo) * sizeof(glm::mat4),
+                           VkDeviceSize(writtenHi - writtenLo) * sizeof(glm::mat4));
     }
 }
 
