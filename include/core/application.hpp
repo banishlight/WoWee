@@ -25,6 +25,7 @@
 #include <mutex>
 #include <thread>
 #include <atomic>
+#include <chrono>
 
 namespace wowee {
 
@@ -68,7 +69,15 @@ public:
     Application& operator=(const Application&) = delete;
 
     bool initialize();
+    /// The main loop, until the window closes: startRun, then runFrame until it
+    /// answers false. Returns when the loop ends.
     void run();
+    /// run() in two halves, for a host that owns the loop itself. The browser
+    /// does: a page that never returns from main never draws, so the wasm build
+    /// calls startRun once and then runFrame from each animation frame.
+    void startRun();
+    /// One iteration of the main loop. False once the client should exit.
+    bool runFrame();
     void shutdown();
 
     /// Tells the interface what the connected pad calls its own buttons, so
@@ -329,6 +338,11 @@ private:
     // hang. Long but healthy work that renders its own frames (world load) must beat
     // it too, or the watchdog mistakes the load for a hang.
     std::atomic<int64_t> watchdogHeartbeatMs_{0};
+    // Set by the watchdog thread when it detects a stall; runFrame releases
+    // the mouse on the main thread, where SDL video calls are allowed.
+    std::atomic<bool> watchdogRequestRelease_{false};
+    // When the previous frame started, for the next frame's delta time.
+    std::chrono::high_resolution_clock::time_point lastFrameTime_{};
 
     AppState state = AppState::AUTHENTICATION;
     bool running = false;
