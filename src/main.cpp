@@ -12,6 +12,9 @@
 #include "core/data_paths.hpp"
 #include <string>
 #include <SDL2/SDL.h>
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+#endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
@@ -220,6 +223,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char* argv[]) {
         constexpr const char* kPlatform = "android";
 #elif defined(__APPLE__)
         constexpr const char* kPlatform = "macos";
+#elif defined(__EMSCRIPTEN__)
+        constexpr const char* kPlatform = "web";
 #elif defined(__linux__)
         constexpr const char* kPlatform = "linux";
 #else
@@ -229,6 +234,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char* argv[]) {
         constexpr const char* kArch = "arm64";
 #elif defined(__x86_64__) || defined(_M_X64)
         constexpr const char* kArch = "x86-64";
+#elif defined(__wasm32__)
+        constexpr const char* kArch = "wasm32";
 #else
         constexpr const char* kArch = "unknown-arch";
 #endif
@@ -238,6 +245,26 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char* argv[]) {
         // Seed portable config from the per-user location on first portable launch.
         wowee::core::migratePortableConfigIfNeeded();
 
+#ifdef __EMSCRIPTEN__
+        // The page owns the loop. main has to return for the browser to draw
+        // anything, so the application outlives it on the heap and each
+        // animation frame runs one iteration of the loop run() would have.
+        auto* webApp = new wowee::core::Application();
+        if (!webApp->initialize()) {
+            LOG_FATAL("Failed to initialize application");
+            return 1;
+        }
+        webApp->startRun();
+        emscripten_set_main_loop_arg([](void* arg) {
+            auto* a = static_cast<wowee::core::Application*>(arg);
+            if (!a->runFrame()) {
+                emscripten_cancel_main_loop();
+                a->shutdown();
+                LOG_INFO("Application exited successfully");
+            }
+        }, webApp, 0, false);
+        return 0;
+#else
         wowee::core::Application app;
 
         if (!app.initialize()) {
@@ -253,6 +280,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char* argv[]) {
         if (g_emergencyDisplay) { XCloseDisplay(g_emergencyDisplay); g_emergencyDisplay = nullptr; }
 #endif
         return 0;
+#endif // __EMSCRIPTEN__
     }
     catch (const std::exception& e) {
         releaseMouseGrab();

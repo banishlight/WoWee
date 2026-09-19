@@ -23,6 +23,27 @@ if(WIN32)
     add_compile_definitions(VK_USE_PLATFORM_WIN32_KHR WIN32_LEAN_AND_MEAN NOMINMAX)
 endif()
 
+# WebAssembly build (emcmake cmake -S . -B build-wasm). Everything is compiled
+# with -pthread, vendored libraries included: the client runs asset loading on
+# worker threads, and wasm-ld refuses to link an object built without atomics
+# into a module with shared memory.
+if(EMSCRIPTEN)
+    add_compile_options(-pthread)
+    add_link_options(-pthread)
+    # Emscripten compiles with exception catching off unless told otherwise, and
+    # then every throw aborts - including the JSON parse errors and the main
+    # loop's rethrows the client relies on catching. Native wasm exceptions,
+    # and longjmp built on them for Lua's error handling.
+    add_compile_options(-fwasm-exceptions -sSUPPORT_LONGJMP=wasm)
+    add_link_options(-fwasm-exceptions -sSUPPORT_LONGJMP=wasm)
+    # On a 32-bit target Vulkan declares every non-dispatchable handle as the
+    # same uint64_t, so vk_utils' destroy() overloads collide and handles no
+    # longer compare with nullptr. There is no driver ABI to honour - the
+    # WebGPU translation layer is compiled with the same define - so make them
+    # distinct pointer types as they are on 64-bit.
+    add_compile_definitions(VK_USE_64_BIT_PTR_DEFINES=1)
+endif()
+
 # Options
 option(BUILD_SHARED_LIBS "Build shared libraries" OFF)
 option(WOWEE_BUILD_TESTS "Build tests" ON)
@@ -314,10 +335,59 @@ if(ANDROID)
     # rather than patched out of the header.
     set_source_files_properties(src/audio/audio_engine.cpp PROPERTIES
                                 COMPILE_OPTIONS "-Wno-unused-parameter")
+elseif(EMSCRIPTEN)
+    include(FetchContent)
+
+    # SDL2 and zlib are Emscripten ports: the flag both puts the headers on the
+    # include path and links the library, building it into the Emscripten
+    # cache on first use. The port installs as <SDL2/SDL.h>, the layout this
+    # client already includes.
+    add_library(SDL2::SDL2 INTERFACE IMPORTED)
+    set_target_properties(SDL2::SDL2 PROPERTIES
+        INTERFACE_COMPILE_OPTIONS "-sUSE_SDL=2"
+        INTERFACE_LINK_OPTIONS    "-sUSE_SDL=2")
+    set(SDL2_FOUND TRUE)
+    add_library(ZLIB::ZLIB INTERFACE IMPORTED)
+    set_target_properties(ZLIB::ZLIB PROPERTIES
+        INTERFACE_COMPILE_OPTIONS "-sUSE_ZLIB=1"
+        INTERFACE_LINK_OPTIONS    "-sUSE_ZLIB=1")
+    set(ZLIB_FOUND TRUE)
+
+    # Header-only, and a host copy would drag the host's /usr/include in front
+    # of the Emscripten sysroot.
+    FetchContent_Declare(glm
+        GIT_REPOSITORY https://github.com/g-truc/glm.git
+        GIT_TAG        1.0.1
+        GIT_SHALLOW    TRUE)
+    FetchContent_MakeAvailable(glm)
+    include_directories(${glm_SOURCE_DIR})
+
+    # The browser has no Vulkan. The renderer is still compiled against the
+    # Vulkan headers, and its calls are resolved by the WebGPU translation
+    # layer rather than by a loader - so this is headers only, pinned to the
+    # version the native build is known to compile against.
+    FetchContent_Declare(VulkanHeaders
+        GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
+        GIT_TAG        v1.4.357
+        GIT_SHALLOW    TRUE)
+    FetchContent_MakeAvailable(VulkanHeaders)
+    add_library(Vulkan::Vulkan INTERFACE IMPORTED)
+    set_property(TARGET Vulkan::Vulkan APPEND PROPERTY
+        INTERFACE_LINK_LIBRARIES Vulkan::Headers)
+    set(Vulkan_FOUND TRUE)
+
+    # OpenSSL comes from tools/build-wasm-deps.sh. The Emscripten toolchain
+    # only searches inside its sysroot, so the prefix has to be made a root
+    # for find_package(OpenSSL) below to see it.
+    if(OPENSSL_ROOT_DIR)
+        list(APPEND CMAKE_FIND_ROOT_PATH ${OPENSSL_ROOT_DIR})
+    endif()
 else()
     find_package(SDL2 REQUIRED)
 endif()
-find_package(Vulkan QUIET)
+if(NOT Vulkan_FOUND)
+    find_package(Vulkan QUIET)
+endif()
 if(NOT Vulkan_FOUND)
     # For Windows cross-compilation the host pkg-config finds the Linux libvulkan-dev
     # and injects /usr/include as an INTERFACE_INCLUDE_DIRECTORY, which causes
@@ -413,13 +483,15 @@ if(CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
 endif()
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
-find_package(ZLIB REQUIRED)
-if(WIN32)
+if(NOT ZLIB_FOUND)
+    find_package(ZLIB REQUIRED)
+endif()
+if(WIN32 OR EMSCRIPTEN)
     find_package(PkgConfig QUIET)
 else()
     find_package(PkgConfig REQUIRED)
 endif()
-if(ANDROID)
+if(ANDROID OR EMSCRIPTEN)
     # Not through pkg-config. There is no Android FFmpeg to find and the host's
     # copy answers with the host's include path, which puts glibc headers in
     # front of the NDK sysroot and fails on the first system header. The same
@@ -473,8 +545,16 @@ if(WIN32)
 endif()
 
 # SPIR-V shader compilation via glslc
-find_program(GLSLC glslc HINTS ${Vulkan_GLSLC_EXECUTABLE} "$ENV{VULKAN_SDK}/bin")
-if(GLSLC)
+#
+# Not from the wasm build: it compiles in place over the tracked .spv, so a
+# second build tree with a different glslc would rewrite them. The native build
+# owns the SPIR-V and the wasm build reads what is committed.
+if(NOT EMSCRIPTEN)
+    find_program(GLSLC glslc HINTS ${Vulkan_GLSLC_EXECUTABLE} "$ENV{VULKAN_SDK}/bin")
+endif()
+if(EMSCRIPTEN)
+    message(STATUS "Shaders: using the committed SPIR-V (wasm build does not run glslc)")
+elseif(GLSLC)
     message(STATUS "Found glslc: ${GLSLC}")
 else()
     message(WARNING "glslc not found. Install the Vulkan SDK or vulkan-tools package.")
@@ -577,6 +657,13 @@ if(EXISTS ${VK_BOOTSTRAP_DIR})
     )
     target_include_directories(vk-bootstrap SYSTEM PUBLIC ${VK_BOOTSTRAP_DIR}/src)
     target_link_libraries(vk-bootstrap PUBLIC Vulkan::Vulkan)
+    if(EMSCRIPTEN)
+        # vk-bootstrap picks its loader and window extensions per platform and
+        # has no branch for Emscripten, so it does not compile. Take the Linux
+        # one: the client hands it vkGetInstanceProcAddr directly, which skips
+        # the dlopen, and creates the device headless.
+        target_compile_definitions(vk-bootstrap PRIVATE __linux__=1)
+    endif()
 else()
     message(FATAL_ERROR "vk-bootstrap not found in extern/vk-bootstrap")
 endif()
@@ -1359,8 +1446,29 @@ endif()
 # Platform-specific libraries
 # Android is UNIX and not APPLE, and has no X11: the ungrab path in main.cpp is
 # compiled out there, so there is nothing to link.
-if(UNIX AND NOT APPLE AND NOT ANDROID)
+if(UNIX AND NOT APPLE AND NOT ANDROID AND NOT EMSCRIPTEN)
     target_link_libraries(wowee PRIVATE X11)
+endif()
+if(EMSCRIPTEN)
+    # Emits wowee.html + wowee.js + wowee.wasm.
+    set_target_properties(wowee PROPERTIES SUFFIX ".html")
+    target_link_options(wowee PRIVATE
+        -sALLOW_MEMORY_GROWTH=1
+        -sMAXIMUM_MEMORY=4GB
+        -sSTACK_SIZE=8MB
+        -sPTHREAD_POOL_SIZE=8
+        # The interface's shaders, fonts and art, and the repo's Data/ (the
+        # expansion profiles and opcode tables), packed into wowee.data and
+        # mounted where the native client finds them beside the executable.
+        # The music is 73 MB of assets/ and is left for streaming.
+        "--preload-file=${CMAKE_CURRENT_SOURCE_DIR}/assets@/assets"
+        "--preload-file=${CMAKE_CURRENT_SOURCE_DIR}/Data@/Data"
+        "--exclude-file=*/Original Music/*"
+        # Temporary: the vk* entry points have no implementation yet. Until the
+        # WebGPU translation layer provides them, a call aborts at runtime
+        # instead of failing the link.
+        -sERROR_ON_UNDEFINED_SYMBOLS=0
+    )
 endif()
 if(APPLE)
     target_link_libraries(wowee PRIVATE "-framework Foundation")

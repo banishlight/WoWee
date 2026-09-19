@@ -272,6 +272,33 @@ You can also specify an expansion: `.\extract_assets.ps1 "C:\Games\WoW\Data" wot
 
 ---
 
+## 🌐 WebAssembly (experimental)
+
+The client compiles to WebAssembly with Emscripten and starts in a browser.
+It does not draw yet: the browser has no Vulkan, and the WebGPU layer that will
+provide the `vk*` calls is not written. Until it is, startup stops at window
+creation.
+
+```bash
+# Once: the Emscripten SDK, and OpenSSL built for wasm32
+git clone https://github.com/emscripten-core/emsdk.git ~/emsdk
+~/emsdk/emsdk install latest && ~/emsdk/emsdk activate latest
+source ~/emsdk/emsdk_env.sh
+tools/build-wasm-deps.sh
+
+# Build
+emcmake cmake -S . -B build-wasm -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DWOWEE_BUILD_TESTS=OFF -DWOWEE_WARNINGS_AS_ERRORS=OFF \
+    -DOPENSSL_ROOT_DIR=$PWD/build-wasm-deps/wasm32
+cmake --build build-wasm --target wowee
+
+# Run: serves with the headers that worker threads need
+tools/serve-wasm.py
+# then open http://localhost:8080/wowee.html
+```
+
+---
+
 ## ⚠️ Notes
 
 - Case matters on Linux (`WoWee` not `wowee`).

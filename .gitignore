@@ -4,6 +4,8 @@ build_asan/
 build-asan/
 build-android/
 build-android-deps/
+build-wasm/
+build-wasm-deps/
 build-debug/
 build-sanitize/
 bin/
