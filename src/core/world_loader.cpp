@@ -679,7 +679,8 @@ void WorldLoader::loadMapGeometry(uint32_t mapId, const std::string& mapName,
                 auto stalledFor = std::chrono::high_resolution_clock::now() - lastProgressTime;
                 if (std::chrono::duration<float>(stalledFor).count() > stallSeconds) {
                     LOG_WARNING("Online terrain streaming stalled for ", stallSeconds,
-                                "s (remaining=", lastRemaining, "), continuing without full preload");
+                                "s (remaining=", lastRemaining, ": ", terrainMgr->describeRemainingTiles(),
+                                "), continuing without full preload");
                     break;
                 }
 

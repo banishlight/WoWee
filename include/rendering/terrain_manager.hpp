@@ -354,6 +354,8 @@ public:
     /** Total unfinished tiles (worker threads + ready queue + finalizing) */
     [[nodiscard]] int getRemainingTileCount() const { return static_cast<int>(pendingTiles.size() + readyQueue.size() + finalizingTiles_.size()); }
     [[nodiscard]] TileCoord getCurrentTile() const { return currentTile; }
+    /** The unfinished tiles and where each one is, for a load that stalls on them. */
+    [[nodiscard]] std::string describeRemainingTiles();
 
     /** Process one ready tile (for loading screens with per-tile progress updates) */
     void processOneReadyTile();

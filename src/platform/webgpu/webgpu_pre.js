@@ -28,6 +28,16 @@ Module['preRun'].push(function () {
   var auto = new URLSearchParams(location.search).get('autologin');
   if (auto !== null) ENV['WOWEE_AUTOLOGIN'] = auto;
   if (new URLSearchParams(location.search).has('enterworld')) ENV['WOWEE_AUTO_ENTER'] = '1';
+  // ?env=NAME=VALUE,NAME=VALUE: settings the client reads from the
+  // environment, such as the cache budgets or WOWEE_FRAME_PROFILE.
+  var env = new URLSearchParams(location.search).get('env');
+  if (env !== null) env.split(',').forEach(function (pair) {
+    var eq = pair.indexOf('=');
+    if (eq > 0) ENV[pair.slice(0, eq)] = pair.slice(eq + 1);
+  });
+  // ?log=debug|info|warn|error: the log level (logger.cpp).
+  var log = new URLSearchParams(location.search).get('log');
+  if (log !== null) ENV['WOWEE_LOG_LEVEL'] = log;
 
   addRunDependency('webgpu-device');
   (async function () {
@@ -36,6 +46,8 @@ Module['preRun'].push(function () {
     }
     var adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
     if (!adapter) throw new Error('WebGPU: no adapter.');
+    var ai = adapter.info || {};
+    console.log('WebGPU adapter: ' + [ai.vendor, ai.architecture, ai.device, ai.description].filter(Boolean).join(' / '));
 
     var wanted = ['texture-compression-bc', 'float32-filterable', 'depth32float-stencil8'];
     var features = wanted.filter(function (f) { return adapter.features.has(f); });

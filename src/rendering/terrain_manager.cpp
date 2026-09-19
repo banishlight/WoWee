@@ -935,6 +935,27 @@ std::shared_ptr<PendingTile> TerrainManager::prepareTile(int x, int y) {
     return pending;
 }
 
+std::string TerrainManager::describeRemainingTiles() {
+    std::string out;
+    auto add = [&out](const TileCoord& c, const char* where) {
+        if (!out.empty()) out += ", ";
+        out += "[" + std::to_string(c.x) + "," + std::to_string(c.y) + "] " + where;
+    };
+    std::unordered_set<TileCoord, TileCoord::Hash> seen;
+    for (const auto& ft : finalizingTiles_) {
+        if (!ft.pending) continue;
+        seen.insert(ft.pending->coord);
+        add(ft.pending->coord, ("finalizing, phase " + std::to_string(static_cast<int>(ft.phase))).c_str());
+    }
+    std::lock_guard<std::mutex> lock(queueMutex);
+    std::unordered_set<TileCoord, TileCoord::Hash> queued(loadQueue.begin(), loadQueue.end());
+    for (const auto& [coord, _] : pendingTiles) {
+        if (seen.count(coord)) continue;
+        add(coord, queued.count(coord) ? "queued for a worker" : "with a worker or ready");
+    }
+    return out.empty() ? "none" : out;
+}
+
 void TerrainManager::logMissingAdtOnce(const std::string& adtPath) {
     std::string normalized = adtPath;
     std::transform(normalized.begin(), normalized.end(), normalized.begin(),
