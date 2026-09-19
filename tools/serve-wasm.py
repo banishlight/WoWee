@@ -35,15 +35,24 @@ class IsolatedHandler(http.server.SimpleHTTPRequestHandler):
     # every one of them.
     protocol_version = "HTTP/1.1"
 
+    def setup(self):
+        super().setup()
+        # The headers and the body go out as separate writes, and on a
+        # kept-alive connection Nagle's algorithm holds the body back until the
+        # browser acknowledges the headers - which it delays by 40 ms. That was
+        # 40 ms on every file the client read.
+        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
     extensions_map = {
         **http.server.SimpleHTTPRequestHandler.extensions_map,
         ".wasm": "application/wasm",
         ".js": "text/javascript",
     }
 
-    # The browser build mounts Data/ and fetches files from it as they are
-    # read, but it has to be told which exist: this path answers with every
-    # file under Data/, one relative path a line (see src/platform/web_data.cpp).
+    # The browser build mounts Data/ and downloads files from it as they are
+    # read, but it has to be told which exist and how large they are: this
+    # path answers with every file under Data/, a relative path, a tab and the
+    # size in bytes a line (see src/platform/web_data.cpp).
     INDEX_PATH = "/Data/.wowee-index"
 
     def data_index(self):
@@ -54,7 +63,11 @@ class IsolatedHandler(http.server.SimpleHTTPRequestHandler):
             for name in filenames:
                 if name.startswith(".wowee-index"):
                     continue
-                lines.append(name if rel == "." else f"{rel}/{name}")
+                try:
+                    size = os.stat(os.path.join(dirpath, name)).st_size
+                except OSError:
+                    continue
+                lines.append(f"{name if rel == '.' else f'{rel}/{name}'}\t{size}")
         return ("\n".join(sorted(lines)) + "\n").encode()
 
     def send_index(self, with_body):

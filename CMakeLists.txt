@@ -1488,6 +1488,10 @@ if(EMSCRIPTEN)
     add_custom_target(wowee_wasm_shaders DEPENDS ${WOWEE_WASM_SHADER_DIR}/manifest.json)
     add_dependencies(wowee wowee_wasm_shaders)
 
+    # web_data.cpp is a WasmFS backend, written against WasmFS's own headers.
+    set_source_files_properties(src/platform/web_data.cpp PROPERTIES
+        INCLUDE_DIRECTORIES "${EMSCRIPTEN_ROOT_PATH}/system/lib/wasmfs")
+
     # Emits wowee.html + wowee.js + wowee.wasm + wowee.data.
     set_target_properties(wowee PROPERTIES SUFFIX ".html")
     target_link_options(wowee PRIVATE
