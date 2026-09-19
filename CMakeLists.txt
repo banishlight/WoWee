@@ -1492,6 +1492,8 @@ if(EMSCRIPTEN)
     target_link_options(wowee PRIVATE
         --use-port=emdawnwebgpu
         "--pre-js=${CMAKE_CURRENT_SOURCE_DIR}/src/platform/webgpu/webgpu_pre.js"
+        # The page itself: the canvas and a status line, no Emscripten banner.
+        "--shell-file=${CMAKE_CURRENT_SOURCE_DIR}/src/platform/web_shell.html"
         -sALLOW_MEMORY_GROWTH=1
         -sMAXIMUM_MEMORY=4GB
         -sSTACK_SIZE=8MB
@@ -1522,6 +1524,7 @@ if(EMSCRIPTEN)
     )
     set_property(TARGET wowee APPEND PROPERTY LINK_DEPENDS
         ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/webgpu/webgpu_pre.js
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/web_shell.html
         ${WOWEE_WASM_SHADER_DIR}/manifest.json)
 endif()
 if(APPLE)

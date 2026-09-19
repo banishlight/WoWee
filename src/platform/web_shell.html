@@ -1,0 +1,71 @@
+<!doctype html>
+<!--
+  The page the browser build runs in (the link step's --shell-file); the
+  generated script goes where {{{ SCRIPT }}} is. Only the canvas: as large as
+  the window allows at the client's own aspect, and a line of status text shows
+  while the page downloads and when something fails.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WoWee</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+      color: #c8c8c8;
+      font: 14px system-ui, sans-serif;
+    }
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    #canvas {
+      display: block;
+      outline: none;
+    }
+    #status {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 24px;
+      text-align: center;
+      pointer-events: none;
+    }
+    #status:empty { display: none; }
+  </style>
+</head>
+<body>
+  <canvas id="canvas" tabindex="-1" oncontextmenu="event.preventDefault()"></canvas>
+  <div id="status">Loading…</div>
+  <script>
+    var statusLine = document.getElementById('status');
+    var Module = {
+      canvas: document.getElementById('canvas'),
+      // Emscripten reports download progress here, then '' when it is done.
+      setStatus: function (text) { statusLine.textContent = text; },
+      print: function (text) { console.log(text); },
+      printErr: function (text) { console.error(text); },
+    };
+    // The element itself is sized to the picture: SDL maps the mouse against
+    // the element's box, so letterboxing inside it would shift every click.
+    function fitCanvas() {
+      var c = Module.canvas;
+      if (!c.width || !c.height) return;
+      var scale = Math.min(innerWidth / c.width, innerHeight / c.height);
+      c.style.width = Math.floor(c.width * scale) + 'px';
+      c.style.height = Math.floor(c.height * scale) + 'px';
+    }
+    addEventListener('resize', fitCanvas);
+    new MutationObserver(fitCanvas).observe(Module.canvas, { attributes: true, attributeFilter: ['width', 'height'] });
+    window.onerror = function (message) {
+      statusLine.textContent = 'Stopped: ' + message + ' (the console has the details)';
+    };
+  </script>
+  {{{ SCRIPT }}}
+</body>
+</html>
