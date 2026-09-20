@@ -121,9 +121,11 @@ Gpu& gpu() {
         x.bc = wgpuDeviceHasFeature(x.device, WGPUFeatureName_TextureCompressionBC);
         x.float32Filterable = wgpuDeviceHasFeature(x.device, WGPUFeatureName_Float32Filterable);
         x.depth32Stencil8 = wgpuDeviceHasFeature(x.device, WGPUFeatureName_Depth32FloatStencil8);
+        x.multiDraw = wgpuDeviceHasFeature(x.device, WGPUFeatureName_MultiDrawIndirect);
         LOG_WARNING("WebGPU device: BC textures ", x.bc ? "yes" : "NO",
                     ", float32-filterable ", x.float32Filterable ? "yes" : "no",
-                    ", depth32float-stencil8 ", x.depth32Stencil8 ? "yes" : "no");
+                    ", depth32float-stencil8 ", x.depth32Stencil8 ? "yes" : "no",
+                    ", multi-draw indirect ", x.multiDraw ? "yes" : "no");
         return x;
     }();
     return g;
@@ -501,23 +503,22 @@ VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
 VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceSurfaceFormatsKHR(
         VkPhysicalDevice, VkSurfaceKHR, uint32_t* pCount, VkSurfaceFormatKHR* pFormats) {
     // A canvas is bgra8unorm or rgba8unorm, never sRGB - but it can be drawn
-    // to through an sRGB view of itself, so those are offered too. The
-    // browser's preferred one comes first, so a renderer that takes the first
-    // it is offered avoids a copy per frame.
+    // to through an sRGB view of itself, so that is offered beside it.
+    //
+    // Only the browser's preferred one is offered. A renderer that asks for
+    // the other gets it - vk-bootstrap takes its desired format wherever it
+    // appears - and the browser then copies the whole canvas every frame to
+    // convert it.
     const bool preferRgba = EM_ASM_INT({
         return navigator.gpu.getPreferredCanvasFormat() === 'rgba8unorm' ? 1 : 0;
     }) != 0;
-    const VkFormat first = preferRgba ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_B8G8R8A8_UNORM;
-    const VkFormat firstSrgb = preferRgba ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_B8G8R8A8_SRGB;
-    const VkFormat second = preferRgba ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM;
-    const VkFormat secondSrgb = preferRgba ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_R8G8B8A8_SRGB;
+    const VkFormat base = preferRgba ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_B8G8R8A8_UNORM;
+    const VkFormat srgb = preferRgba ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_B8G8R8A8_SRGB;
     const VkSurfaceFormatKHR formats[] = {
-        {first, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
-        {firstSrgb, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
-        {second, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
-        {secondSrgb, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
+        {base, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
+        {srgb, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR},
     };
-    return fillArray(pCount, pFormats, formats, 4);
+    return fillArray(pCount, pFormats, formats, 2);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceSurfacePresentModesKHR(

@@ -49,7 +49,12 @@ Module['preRun'].push(function () {
     var ai = adapter.info || {};
     console.log('WebGPU adapter: ' + [ai.vendor, ai.architecture, ai.device, ai.description].filter(Boolean).join(' / '));
 
-    var wanted = ['texture-compression-bc', 'float32-filterable', 'depth32float-stencil8'];
+    console.log('WebGPU adapter features: ' + Array.from(adapter.features).join(' '));
+    // multi-draw-indirect collapses a batch of draws into one call, which is
+    // most of what a frame spends in the layer. Chromium only, and only with
+    // --enable-unsafe-webgpu; the client falls back to a draw each.
+    var wanted = ['texture-compression-bc', 'float32-filterable', 'depth32float-stencil8',
+                  'chromium-experimental-multi-draw-indirect', 'indirect-first-instance'];
     var features = wanted.filter(function (f) { return adapter.features.has(f); });
 
     // The adapter's own limits first. Not every browser will make a device
