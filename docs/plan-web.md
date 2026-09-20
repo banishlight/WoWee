@@ -190,21 +190,15 @@ skips draws with a refused pipeline rather than losing the frame.
 
 ## Hosting
 
-The page needs a secure context (HTTPS) for WebGPU and for the shared memory
-the threads use, and it must be cross-origin isolated
-(`Cross-Origin-Opener-Policy: same-origin`,
-`Cross-Origin-Embedder-Policy: require-corp`). So:
+Serving this anywhere but localhost needs three things the development server
+does not have: HTTPS, because WebGPU and the shared memory the threads use
+both need a secure context; the two isolation headers on every response; and
+a relay that opens connections only to the game server's own ports.
+`tools/serve-wasm.py` will connect anywhere it is asked, which is why it
+binds to localhost - `tools/wowee-relay.py` is the one to put behind a real
+web server.
 
-- a real web server (Caddy or nginx) with a TLS certificate, those two
-  headers, and range requests for `Data/`;
-- the relay behind TLS as `wss://`, restricted to the game server's own
-  ports - `serve-wasm.py` will connect anywhere it is asked and is for
-  localhost only;
-- only the build output and the data deployed; there is no need to build on
-  the server.
-
-The game data is Blizzard's. Serving it to whoever opens the page is
-distributing it. For a private server, put the page behind a login. The
-better design is for each player to import their own client's data into
-browser storage once; WasmFS has an OPFS backend for exactly that, and
-`web_data.cpp` is where it would go.
+The game data is Blizzard's, and serving it is distributing it. Whatever
+serves it should ask for a password. The better design is for each player to
+import their own client's data into browser storage once; WasmFS has an OPFS
+backend for that, and `web_data.cpp` is where it would go.
