@@ -87,6 +87,9 @@ struct Gpu {
     bool bc = false;               // texture-compression-bc
     bool float32Filterable = false;
     bool depth32Stencil8 = false;
+    // One call for a whole indirect batch instead of one per draw. Chromium
+    // only, behind its experimental flag, so every use needs the fallback.
+    bool multiDraw = false;
 };
 Gpu& gpu();
 bool onMainThread();
@@ -190,6 +193,10 @@ struct VkBuffer_T {
     std::vector<std::pair<VkDeviceSize, VkDeviceSize>> dirty;
     bool everFlushed = false;
     bool warnedUnflushed = false;
+    // What was last sent to the GPU, for a buffer small enough to be sent
+    // whole: most of them hold the same bytes frame after frame, and the
+    // comparison is far cheaper than the upload. Empty until the first one.
+    std::vector<uint8_t> uploaded;
 
     WGPUBuffer ensureGpu();
     /// The CPU copy of this buffer's contents, if it lives in mapped memory.

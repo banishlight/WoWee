@@ -22,6 +22,8 @@
 using namespace wgpuvk;
 namespace c = wgpuvk::cmd;
 
+#include <chrono>
+#include "core/env_flag.hpp"
 namespace {
 
 constexpr uint64_t kRingBytes = 16ull * 1024 * 1024;
@@ -224,13 +226,56 @@ WGPUTextureAspect copyAspect(VkImageAspectFlags a, const FormatInfo& fi) {
     return WGPUTextureAspect_All;
 }
 
+/// What a frame cost the layer, when WOWEE_FRAME_PROFILE asks for it.
+///
+/// A frame is thousands of calls into WebGPU, and each one crosses from wasm
+/// into the browser - which is most of what the layer spends. So the counts
+/// are what to watch here, more than the milliseconds.
+struct ReplayStats {
+    bool on = wowee::core::envFlagEnabled("WOWEE_FRAME_PROFILE", false);
+    double uploadMs = 0, replayMs = 0, submitMs = 0;
+    long frames = 0, commands = 0, draws = 0, pipelines = 0, groups = 0, vertex = 0, index = 0;
+    long writes = 0;
+    uint64_t writeBytes = 0;
+    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+
+    void report() {
+        if (!on || ++frames < 100) return;
+        const double windowMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - since).count();
+        LOG_WARNING("WebGPU per frame: ", windowMs / frames, "ms, of which uploads ", uploadMs / frames,
+                    "ms and replay ", replayMs / frames, "ms | ", commands / frames, " commands become ",
+                    draws / frames, " draws, ", groups / frames, " bind groups, ", pipelines / frames,
+                    " pipelines, ", vertex / frames, "+", index / frames, " buffer binds, ",
+                    writes / frames, " uploads of ", (writeBytes / frames) >> 10, " KB");
+        *this = ReplayStats{};
+    }
+};
+ReplayStats& stats() {
+    static ReplayStats s;
+    return s;
+}
+
 class Replayer {
 public:
     void run(const std::vector<VkCommandBuffer_T*>& buffers) {
+        auto& st = stats();
+        using clock = std::chrono::steady_clock;
+        const auto t0 = clock::now();
         uploadHostBuffers(buffers);
-        for (auto* cb : buffers) runList(cb->commands);
+        const auto t1 = clock::now();
+        for (auto* cb : buffers) {
+            st.commands += static_cast<long>(cb->commands.size());
+            runList(cb->commands);
+        }
+        const auto t2 = clock::now();
         endPasses();
         submit();
+        const auto t3 = clock::now();
+        st.uploadMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        st.replayMs += std::chrono::duration<double, std::milli>(t2 - t1).count();
+        st.submitMs += std::chrono::duration<double, std::milli>(t3 - t2).count();
+        st.report();
         for (auto v : transientViews_) wgpuTextureViewRelease(v);
         for (auto g : transientGroups_) wgpuBindGroupRelease(g);
         transientViews_.clear();
@@ -341,6 +386,18 @@ private:
 
     /// Brings the GPU copy of every host-visible buffer this submission reads
     /// up to date with what the CPU wrote, as coherent memory would be.
+    /// True when data differs from what was last uploaded, remembering it.
+    /// WOWEE_WGPU_PLAIN=1 turns this and the batched draws off, to measure
+    /// what they are worth on a scene.
+    static bool changed(VkBuffer_T* b, const uint8_t* data, VkDeviceSize len) {
+        static const bool plain = wowee::core::envFlagEnabled("WOWEE_WGPU_PLAIN", false);
+        if (plain) return true;
+        if (b->uploaded.size() == len && std::memcmp(b->uploaded.data(), data, len) == 0)
+            return false;
+        b->uploaded.assign(data, data + len);
+        return true;
+    }
+
     void uploadHostBuffers(const std::vector<VkCommandBuffer_T*>& buffers) {
         std::unordered_set<VkBuffer_T*> host;
         for (auto* cb : buffers) collect(cb->commands, host);
@@ -349,7 +406,14 @@ private:
             const VkDeviceSize room = b->memory->size - b->memoryOffset;
             const VkDeviceSize limit = std::min<VkDeviceSize>((b->size + 3) & ~VkDeviceSize(3), room) & ~VkDeviceSize(3);
             if (b->size <= kWholeUploadMax) {
-                if (limit) wgpuQueueWriteBuffer(gpu().queue, b->ensureGpu(), 0, data, limit);
+                // Whole, but only when it differs from what the GPU has: a
+                // frame uses thousands of these and most hold what they held
+                // last frame. Comparing costs a fraction of the upload, and
+                // the calls saved are what the frame was spending.
+                if (limit && changed(b, data, limit)) {
+                    ++stats().writes; stats().writeBytes += limit;
+                    wgpuQueueWriteBuffer(gpu().queue, b->ensureGpu(), 0, data, limit);
+                }
                 continue;
             }
             // A large buffer: just what was flushed since the last upload,
@@ -369,7 +433,7 @@ private:
                 VkDeviceSize lo = ranges[i].first & ~VkDeviceSize(3), hi = ranges[i].second;
                 for (++i; i < ranges.size() && ranges[i].first <= hi; ++i) hi = std::max(hi, ranges[i].second);
                 hi = std::min((hi + 3) & ~VkDeviceSize(3), limit);
-                if (hi > lo) wgpuQueueWriteBuffer(gpu().queue, b->ensureGpu(), lo, data + lo, hi - lo);
+                if (hi > lo) { ++stats().writes; stats().writeBytes += hi - lo; wgpuQueueWriteBuffer(gpu().queue, b->ensureGpu(), lo, data + lo, hi - lo); }
             }
         }
     }
@@ -407,18 +471,29 @@ private:
                 },
                 [&](const c::Draw& x) {
                     if (prepareDraw(false))
-                        wgpuRenderPassEncoderDraw(pass_, x.vertexCount, x.instanceCount, x.firstVertex, x.firstInstance);
+                        ++stats().draws, wgpuRenderPassEncoderDraw(pass_, x.vertexCount, x.instanceCount, x.firstVertex, x.firstInstance);
                 },
                 [&](const c::DrawIndexed& x) {
                     if (prepareDraw(true))
-                        wgpuRenderPassEncoderDrawIndexed(pass_, x.indexCount, x.instanceCount, x.firstIndex,
+                        ++stats().draws, wgpuRenderPassEncoderDrawIndexed(pass_, x.indexCount, x.instanceCount, x.firstIndex,
                                                          x.vertexOffset, x.firstInstance);
                 },
                 [&](const c::DrawIndexedIndirect& x) {
                     if (!prepareDraw(true)) return;
                     WGPUBuffer b = x.buffer->ensureGpu();
+                    // The whole batch in one call where the browser can, which
+                    // is thousands of calls a frame saved. It takes the entries
+                    // packed, as Vulkan's own struct; any other stride falls
+                    // back to a draw each.
+                    static const bool plain = wowee::core::envFlagEnabled("WOWEE_WGPU_PLAIN", false);
+                    if (!plain && gpu().multiDraw && x.count > 1 &&
+                        x.stride == sizeof(VkDrawIndexedIndirectCommand)) {
+                        ++stats().draws;
+                        wgpuRenderPassEncoderMultiDrawIndexedIndirect(pass_, b, x.offset, x.count, nullptr, 0);
+                        return;
+                    }
                     for (uint32_t i = 0; i < x.count; ++i)
-                        wgpuRenderPassEncoderDrawIndexedIndirect(pass_, b, x.offset + uint64_t(i) * x.stride);
+                        ++stats().draws, wgpuRenderPassEncoderDrawIndexedIndirect(pass_, b, x.offset + uint64_t(i) * x.stride);
                 },
                 [&](const c::Dispatch& x) {
                     if (prepareDispatch())
@@ -681,14 +756,14 @@ private:
         WGPURenderPipeline rp = p->renderPipeline(biasConstant_, biasSlope_, biasClamp_);
         if (!rp) return false;
         if (rp != boundRender_) {
-            wgpuRenderPassEncoderSetPipeline(pass_, rp);
+            ++stats().pipelines, wgpuRenderPassEncoderSetPipeline(pass_, rp);
             boundRender_ = rp;
             // Groups set for another pipeline layout may not suit this one.
             boundGroups_ = {};
             for (auto& o : boundOffsets_) o.clear();
         }
         const bool ok = bindGroups(p, [&](uint32_t g, WGPUBindGroup group, const std::vector<uint32_t>& offs) {
-            wgpuRenderPassEncoderSetBindGroup(pass_, g, group, offs.size(), offs.data());
+            ++stats().groups, wgpuRenderPassEncoderSetBindGroup(pass_, g, group, offs.size(), offs.data());
         });
         if (!ok) return false;
         for (size_t slot = 0; slot < p->vertexBindings.size(); ++slot) {
@@ -696,7 +771,7 @@ private:
             const VB& vb = b < vertexBuffers_.size() ? vertexBuffers_[b] : VB{};
             if (!vb.buffer) return false;
             if (boundVertex_[slot].buffer != vb.buffer || boundVertex_[slot].offset != vb.offset) {
-                wgpuRenderPassEncoderSetVertexBuffer(pass_, static_cast<uint32_t>(slot), vb.buffer->ensureGpu(),
+                ++stats().vertex, wgpuRenderPassEncoderSetVertexBuffer(pass_, static_cast<uint32_t>(slot), vb.buffer->ensureGpu(),
                                                      vb.offset, WGPU_WHOLE_SIZE);
                 boundVertex_[slot] = vb;
             }
@@ -704,7 +779,7 @@ private:
         if (indexed) {
             if (!indexBuffer_) return false;
             if (indexDirty_) {
-                wgpuRenderPassEncoderSetIndexBuffer(pass_, indexBuffer_->ensureGpu(),
+                ++stats().index, wgpuRenderPassEncoderSetIndexBuffer(pass_, indexBuffer_->ensureGpu(),
                     indexType_ == VK_INDEX_TYPE_UINT32 ? WGPUIndexFormat_Uint32 : WGPUIndexFormat_Uint16,
                     indexOffset_, WGPU_WHOLE_SIZE);
                 indexDirty_ = false;
