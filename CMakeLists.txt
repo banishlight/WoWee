@@ -1464,7 +1464,10 @@ if(EMSCRIPTEN)
         src/platform/webgpu/replay.cpp
         src/platform/webgpu/resources.cpp
     )
-    target_compile_options(wowee PRIVATE --use-port=emdawnwebgpu)
+    # SIMD is in every browser that has WebGPU, and the client is full of
+    # work that uses it: animation, mesh building, and the layer's comparison
+    # of what a buffer holds against what the GPU has.
+    target_compile_options(wowee PRIVATE --use-port=emdawnwebgpu -msimd128)
 
     # The shaders, translated to WGSL beside the SPIR-V the renderer loads.
     # Needs glslc, spirv-opt and naga on the build machine; see the script.
