@@ -818,14 +818,17 @@ private:
             WGPUBuffer dst = x.dst->ensureGpu();
             for (const auto& r : x.regions) {
                 const uint64_t size = (r.size + 3) & ~uint64_t(3);
+                if (!size) continue;   // WebGPU refuses a write of nothing
                 wgpuQueueWriteBuffer(gpu().queue, dst, r.dstOffset, host + r.srcOffset, size);
             }
             return;
         }
         endPasses();
         for (const auto& r : x.regions) {
+            const uint64_t size = (r.size + 3) & ~uint64_t(3);
+            if (!size) continue;
             wgpuCommandEncoderCopyBufferToBuffer(encoder(), x.src->ensureGpu(), r.srcOffset,
-                                                 x.dst->ensureGpu(), r.dstOffset, (r.size + 3) & ~uint64_t(3));
+                                                 x.dst->ensureGpu(), r.dstOffset, size);
         }
         encoded_ = true;
         if (x.dst->hostData()) warnReadback("vkCmdCopyBuffer");
@@ -862,6 +865,8 @@ private:
             // is smaller than one.
             WGPUExtent3D extent = {(r.imageExtent.width + bd - 1) / bd * bd,
                                    (r.imageExtent.height + bd - 1) / bd * bd, depth};
+            if (!size || !extent.width || !extent.height || !extent.depthOrArrayLayers) continue;
+            ++stats().writes;
             wgpuQueueWriteTexture(gpu().queue, &dst, host + r.bufferOffset, size, &layout, &extent);
         }
     }
@@ -1019,6 +1024,7 @@ private:
 
     void fillBuffer(const c::FillBuffer& x) {
         const uint64_t size = x.size == VK_WHOLE_SIZE ? x.buffer->size - x.offset : x.size;
+        if (!(size & ~uint64_t(3))) return;   // nothing to fill, and WebGPU refuses it
         if (x.data == 0) {
             endPasses();
             wgpuCommandEncoderClearBuffer(encoder(), x.buffer->ensureGpu(), x.offset, size & ~uint64_t(3));

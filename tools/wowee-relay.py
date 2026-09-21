@@ -9,7 +9,8 @@ and passes bytes both ways (see src/platform/web_socket.cpp).
 
 Unlike tools/serve-wasm.py's built-in relay, which is for localhost testing
 and will connect anywhere it is asked, this one opens a connection only to a
-target named on its command line. Without that, anyone who can reach the page
+target named on its command line - by where the name points, so localhost,
+127.0.0.1 and the server's own host name are one target, not three. Without that, anyone who can reach the page
 could use the server to reach anything the server can reach - including the
 machines behind it.
 
@@ -30,9 +31,38 @@ import urllib.parse
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
+def addresses(host: str, port: int) -> set[str]:
+    """Where a name points now, as addresses."""
+    try:
+        return {info[4][0] for info in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)}
+    except OSError:
+        return set()
+
+
 class RelayHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     allowed: set[tuple[str, int]] = set()
+
+    def permitted(self, host: str, port: int) -> str | None:
+        """The address to connect to for this target, or None if it is not one
+        this relay serves.
+
+        Names are compared by where they point, not by how they are spelled:
+        the page may ask for localhost, 127.0.0.1 or the server's own host
+        name, and they are the same machine. The address that matched is what
+        gets connected to, so a name cannot resolve to something else between
+        the check and the connection.
+        """
+        wanted = addresses(host, port)
+        if not wanted:
+            return None
+        for allowed_host, allowed_port in self.allowed:
+            if allowed_port != port:
+                continue
+            shared = wanted & addresses(allowed_host, allowed_port)
+            if shared:
+                return sorted(shared)[0]
+        return None
 
     def log_message(self, fmt, *args):
         sys.stderr.write("relay: " + (fmt % args) + "\n")
@@ -48,12 +78,13 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
         if not host or not port.isdigit() or not key:
             self.send_error(400, "want /relay?target=host:port as a WebSocket")
             return
-        if (host, int(port)) not in self.allowed:
+        address = self.permitted(host, int(port))
+        if address is None:
             self.log_message("refused %s", target)
             self.send_error(403, "not a target this relay serves")
             return
         try:
-            upstream = socket.create_connection((host, int(port)), timeout=10)
+            upstream = socket.create_connection((address, int(port)), timeout=10)
         except OSError as e:
             self.log_message("%s unreachable: %s", target, e)
             self.send_error(502, f"{target} unreachable")
@@ -72,6 +103,10 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
 
         client = self.connection
         send_lock = threading.Lock()
+        # Who said what, and who stopped: a connection that opens and closes
+        # with nothing sent is a different fault from one that carries a login
+        # and is then dropped by the game server.
+        counts = {"to_client": 0, "to_server": 0, "ended_by": "?"}
 
         def send_frame(opcode, payload):
             n = len(payload)
@@ -89,7 +124,9 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
                 while True:
                     data = upstream.recv(65536)
                     if not data:
+                        counts["ended_by"] = "game server"
                         break
+                    counts["to_client"] += len(data)
                     send_frame(0x2, data)
             except OSError:
                 pass
@@ -116,10 +153,12 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
                 for i in range(len(data)):
                     data[i] ^= mask[i & 3]
                 if opcode == 0x8:          # close
+                    counts["ended_by"] = "browser"
                     break
                 if opcode == 0x9:          # ping
                     send_frame(0xA, bytes(data))
                 elif opcode in (0x0, 0x1, 0x2):
+                    counts["to_server"] += len(data)
                     upstream.sendall(data)
         except OSError:
             pass
@@ -131,7 +170,8 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
             upstream.close()
             pump.join(timeout=2)
             self.close_connection = True
-            self.log_message("closed %s", target)
+            self.log_message("closed %s - %d bytes to the game server, %d back, ended by the %s",
+                             target, counts["to_server"], counts["to_client"], counts["ended_by"])
 
 
 def main():

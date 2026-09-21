@@ -50,6 +50,7 @@
 #include "wasmfs.h"
 
 #include "core/logger.hpp"
+#include "core/version.hpp"
 
 namespace wowee::platform {
 
@@ -68,8 +69,14 @@ std::unordered_map<std::string, uint32_t> gSizes;
 /// A worker can ask for an ArrayBuffer; the page's own thread may only make a
 /// synchronous request for text, so there the bytes come back one per
 /// character.
-EM_JS(int, fetchInto, (const char* path, uint8_t* dst, int size), {
-    var url = UTF8ToString(path).split('/').map(encodeURIComponent).join('/');
+/// The build, on the end of every request: a browser that has an answer for
+/// one of these URLs got it from this same client. Without it, anything a
+/// browser cached - including a "not found" from a server that was still
+/// being set up - is what the client keeps seeing, with no request made and
+/// no way to tell from this side.
+EM_JS(int, fetchInto, (const char* path, uint8_t* dst, int size, const char* build), {
+    var url = UTF8ToString(path).split('/').map(encodeURIComponent).join('/') +
+              '?v=' + encodeURIComponent(UTF8ToString(build));
     var xhr = new XMLHttpRequest();
     xhr.open('GET', url, false);
     var worker = typeof window == 'undefined';
@@ -94,9 +101,9 @@ EM_JS(int, fetchInto, (const char* path, uint8_t* dst, int size), {
 
 /// The index, which has no size to go by: asks for it once to learn how
 /// large it is, then again into a buffer that size.
-EM_JS(int, fetchIndexSize, (const char* path), {
+EM_JS(int, fetchIndexSize, (const char* path, const char* build), {
     var xhr = new XMLHttpRequest();
-    xhr.open('HEAD', UTF8ToString(path), false);
+    xhr.open('HEAD', UTF8ToString(path) + '?v=' + encodeURIComponent(UTF8ToString(build)), false);
     try {
         xhr.send();
     } catch (e) {
@@ -135,7 +142,8 @@ private:
     ssize_t read(uint8_t* buf, size_t len, off_t offset) override {
         if (!loaded_) {
             data_.resize(size_);
-            const int got = fetchInto(path_.c_str() + 1, data_.data(), static_cast<int>(size_));
+            const int got = fetchInto(path_.c_str() + 1, data_.data(), static_cast<int>(size_),
+                                      core::kVersion);
             if (got < 0) {
                 LOG_ERROR("Game data: could not download ", path_);
                 data_ = {};
@@ -217,13 +225,14 @@ bool touch(const char* path) {
 
 bool mountWebData() {
     // The index: a relative path and a size a line, tab between them.
-    const int indexSize = fetchIndexSize(kIndexUrl);
+    const int indexSize = fetchIndexSize(kIndexUrl, core::kVersion);
     if (indexSize <= 0) {
         LOG_ERROR("No game data index from the server (", kIndexUrl, ")");
         return false;
     }
     std::string index(static_cast<size_t>(indexSize), '\0');
-    const int got = fetchInto(kIndexUrl, reinterpret_cast<uint8_t*>(index.data()), indexSize);
+    const int got = fetchInto(kIndexUrl, reinterpret_cast<uint8_t*>(index.data()), indexSize,
+                              core::kVersion);
     if (got < 0) {
         LOG_ERROR("Could not download ", kIndexUrl);
         return false;

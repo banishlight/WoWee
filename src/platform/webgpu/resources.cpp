@@ -149,7 +149,9 @@ const uint8_t* VkBuffer_T::hostData() const {
 WGPUBuffer VkBuffer_T::ensureGpu() {
     if (gpu) return gpu;
     WGPUBufferDescriptor desc = WGPU_BUFFER_DESCRIPTOR_INIT;
-    desc.size = alignUp(size, 4);
+    // Never nothing: WebGPU refuses a buffer of no size, where Vulkan allows
+    // one and the renderer makes them for empty batches.
+    desc.size = std::max<VkDeviceSize>(alignUp(size, 4), 4);
     WGPUBufferUsage u = WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst;
     if (usage & VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)   u |= WGPUBufferUsage_Vertex;
     if (usage & VK_BUFFER_USAGE_INDEX_BUFFER_BIT)    u |= WGPUBufferUsage_Index;

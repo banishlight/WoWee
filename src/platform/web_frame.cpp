@@ -22,7 +22,32 @@ namespace wowee::platform {
 namespace {
 
 EM_ASYNC_JS(void, waitForAnimationFrame, (), {
-    await new Promise(function (resolve) { requestAnimationFrame(resolve); });
+    // The next animation frame, or 100ms, whichever comes first.
+    //
+    // A browser stops calling back for frames whenever it is not painting the
+    // page - a hidden tab, a window behind another, a compositor that has
+    // given up on the canvas. Waiting only for the callback means the client
+    // stops with it: no network, no keepalives, and the game server drops the
+    // connection. Firefox stops calling back mid-load, which is what froze it
+    // there; Chromium kept going, so this never showed until now.
+    //
+    // So the frame waits for the callback, and carries on without it if it
+    // does not come. The picture is only as fresh as the browser's painting
+    // either way, but the client stays alive behind it.
+    await new Promise(function (resolve) {
+        var done = false;
+        var frame = requestAnimationFrame(function () {
+            if (done) return;
+            done = true;
+            resolve();
+        });
+        setTimeout(function () {
+            if (done) return;
+            done = true;
+            cancelAnimationFrame(frame);
+            resolve();
+        }, 100);
+    });
 });
 
 uint64_t gYielded = 0;

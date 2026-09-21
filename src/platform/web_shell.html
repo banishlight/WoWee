@@ -62,6 +62,39 @@
     }
     addEventListener('resize', fitCanvas);
     new MutationObserver(fitCanvas).observe(Module.canvas, { attributes: true, attributeFilter: ['width', 'height'] });
+    // The client's main loop runs as a promise, so a failure inside it
+    // arrives here rather than at onerror - and said nothing at all, which is
+    // how a Firefox-only fault took an afternoon to find.
+    //
+    // A pointer lock the browser declines - already held, asked too fast, or
+    // wanting a fresh click - is not a failure: the client asks again on the
+    // next click. Browsers word it differently (NotAllowedError,
+    // InUseAttributeError, "already locked"), so match the sense, not a name.
+    function benign(r) {
+      if (!r) return false;
+      var msg = String(r.message || r);
+      return r.name === 'NotAllowedError' || r.name === 'InUseAttributeError' ||
+             /pointer|already locked|user gesture|autoplay/i.test(msg);
+    }
+    // The first frame of ours in the stack, so a stopped client names where it
+    // stopped on screen - a report can be a screenshot, without the console.
+    function where(r) {
+      if (!r || !r.stack) return '';
+      var lines = String(r.stack).split('\n');
+      for (var i = 0; i < lines.length; i++) {
+        if (/wasm|wowee/i.test(lines[i])) return ' — ' + lines[i].trim().slice(0, 140);
+      }
+      return lines[0] ? ' — ' + lines[0].trim().slice(0, 140) : '';
+    }
+    var stopped = false;
+    addEventListener('unhandledrejection', function (e) {
+      var r = e.reason;
+      if (benign(r) || stopped) return;   // the first fault is the one to show
+      stopped = true;
+      var text = r && r.message ? r.name + ': ' + r.message : String(r);
+      console.error('Stopped: ' + text, r);
+      statusLine.textContent = 'Stopped: ' + text + where(r);
+    });
     window.onerror = function (message) {
       statusLine.textContent = 'Stopped: ' + message + ' (the console has the details)';
     };

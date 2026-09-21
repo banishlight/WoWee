@@ -1,3 +1,71 @@
+
+// Firefox will not take a view into memory larger than 2 GB.
+//
+// Every WebGPU call that takes bytes - an upload, a bind group's dynamic
+// offsets - is handed a small window into the client's own memory. Firefox
+// rejects those outright once that memory passes 2 GB ("can't be an
+// ArrayBuffer or an ArrayBufferView larger than 2 GB"), however few bytes the
+// window itself covers, and the throw unwinds the client. The client passes
+// 2 GB as soon as a world is loaded, so this is the difference between the
+// game running in Firefox and dying the moment it arrives.
+//
+// So: where the view is into memory that large, copy the part being used into
+// a small array of its own first. Chromium never takes this path.
+(function () {
+  // Only once a browser has refused one: copying costs a small array per call,
+  // thousands of calls a frame, and Chromium - which takes the views as they
+  // are - would pay it for nothing.
+  var LIMIT = 2147483648;
+  var copying = false;
+  var huge = function (v) {
+    return copying && ArrayBuffer.isView(v) && v.buffer && v.buffer.byteLength > LIMIT;
+  };
+  var refused = function (e) {
+    return e instanceof TypeError && /2 ?GB/.test(String(e.message));
+  };
+  // Tries the call as it is; if the browser refuses the view for its size,
+  // copies from then on and tries again.
+  var wrap = function (proto, name, copied) {
+    if (!proto || typeof proto[name] !== 'function') return;
+    var orig = proto[name];
+    proto[name] = function () {
+      if (copying) {
+        var args = copied(arguments);
+        if (args) return orig.apply(this, args);
+        return orig.apply(this, arguments);
+      }
+      try {
+        return orig.apply(this, arguments);
+      } catch (e) {
+        if (!refused(e)) throw e;
+        copying = true;
+        console.warn('WebGPU: this browser refuses views into memory over 2 GB; copying them from now on');
+        return orig.apply(this, copied(arguments) || arguments);
+      }
+    };
+  };
+  wrap(self.GPUQueue && GPUQueue.prototype, 'writeBuffer', function (a) {
+    var data = a[2];
+    if (!huge(data)) return null;
+    var start = a[3] || 0;
+    var count = a[4] === undefined ? data.length - start : a[4];
+    return [a[0], a[1], data.slice(start, start + count)];
+  });
+  wrap(self.GPUQueue && GPUQueue.prototype, 'writeTexture', function (a) {
+    if (!huge(a[1])) return null;
+    return [a[0], a[1].slice(), a[2], a[3]];
+  });
+  ['GPURenderPassEncoder', 'GPUComputePassEncoder', 'GPURenderBundleEncoder'].forEach(function (name) {
+    wrap(self[name] && self[name].prototype, 'setBindGroup', function (a) {
+      var offsets = a[2];
+      if (!huge(offsets)) return null;
+      var from = a[3] || 0;
+      var count = a[4] === undefined ? offsets.length - from : a[4];
+      return [a[0], a[1], offsets.slice(from, from + count)];
+    });
+  });
+})();
+
 // Asks the browser for a WebGPU device before main() runs.
 //
 // Getting a device is asynchronous and the client's startup is not, so the
