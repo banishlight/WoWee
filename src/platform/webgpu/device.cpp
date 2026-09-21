@@ -32,6 +32,16 @@ VkDevice_T* gDevice = nullptr;
 std::mutex gMainMutex;
 std::vector<std::function<void()>> gMainQueue;
 
+// Parked resource teardown, in per-frame buckets (see releaseLater). A
+// teardown parked while gRetireHead points at a bucket is run when the ring
+// comes back round to it, kRetireSlots frames later - long enough that no
+// submission still in flight, nor a command buffer recorded before the
+// destroy and not yet replayed, can still name the resource.
+constexpr int kRetireSlots = 6;
+std::mutex gRetireMutex;
+std::vector<std::function<void()>> gRetire[kRetireSlots];
+int gRetireHead = 0;
+
 // Device-local memory, then host-visible memory twice: coherent, and not.
 // A host-visible buffer's GPU copy is brought up to date from its CPU copy
 // when a submission uses it. Coherent memory is what small buffers get and
@@ -145,7 +155,18 @@ void runOnMain(std::function<void()> fn) {
 }
 
 void releaseLater(std::function<void()> fn) {
-    runOnMain(std::move(fn));
+    std::lock_guard<std::mutex> lock(gRetireMutex);
+    gRetire[gRetireHead].push_back(std::move(fn));
+}
+
+void retireFrame() {
+    std::vector<std::function<void()>> due;
+    {
+        std::lock_guard<std::mutex> lock(gRetireMutex);
+        gRetireHead = (gRetireHead + 1) % kRetireSlots;
+        due.swap(gRetire[gRetireHead]);   // the bucket about to be reused is the oldest
+    }
+    for (auto& fn : due) fn();
 }
 
 void drainMainQueue() {
@@ -595,10 +616,9 @@ VKAPI_ATTR void VKAPI_CALL vkDestroySwapchainKHR(VkDevice, VkSwapchainKHR sc, co
     if (!sc) return;
     if (sc->current) wgpuTextureRelease(sc->current);
     for (auto* img : sc->images) {
-        if (img->gpu) {
-            wgpuTextureDestroy(img->gpu);
-            wgpuTextureRelease(img->gpu);
-        }
+        // Release, not destroy (see vkDestroyBuffer): the queue may still be
+        // presenting from these.
+        if (img->gpu) wgpuTextureRelease(img->gpu);
         delete img;
     }
     delete sc;
@@ -639,6 +659,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueuePresentKHR(VkQueue, const VkPresentInfoKHR
         ++sc->frame;
         if (info->pResults) info->pResults[i] = VK_SUCCESS;
     }
+    retireFrame();
     return VK_SUCCESS;
 }
 

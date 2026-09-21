@@ -163,6 +163,38 @@ WGPUBuffer VkBuffer_T::ensureGpu() {
     return gpu;
 }
 
+void retainImage(VkImage_T* image) {
+    if (image && !image->swapchain) image->refs.fetch_add(1, std::memory_order_relaxed);
+}
+
+void releaseImage(VkImage_T* image) {
+    // Swapchain images belong to the swapchain and are freed with it.
+    if (!image || image->swapchain) return;
+    if (image->refs.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
+    // Last reference gone. Release (never destroy - that would pull the texture
+    // out from under GPU work in flight), and defer even that a few frames,
+    // past any command recorded before now and not yet replayed.
+    releaseLater([image] {
+        if (image->gpu) wgpuTextureRelease(image->gpu);
+        delete image;
+    });
+}
+
+void retainView(VkImageView_T* view) {
+    if (view) view->refs.fetch_add(1, std::memory_order_relaxed);
+}
+
+void releaseView(VkImageView_T* view) {
+    if (!view) return;
+    if (view->refs.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
+    VkImage_T* image = view->image;
+    releaseLater([view] {
+        if (view->gpu) wgpuTextureViewRelease(view->gpu);
+        delete view;
+    });
+    releaseImage(image);            // the view let go of its image
+}
+
 WGPUTexture VkImage_T::ensureGpu() {
     if (swapchain) {
         if (!swapchain->current) {
@@ -388,10 +420,13 @@ VKAPI_ATTR void VKAPI_CALL vkDestroyBuffer(VkDevice, VkBuffer buffer, const VkAl
         m->buffers.erase(std::remove(m->buffers.begin(), m->buffers.end(), buffer), m->buffers.end());
     }
     releaseLater([buffer] {
-        if (buffer->gpu) {
-            wgpuBufferDestroy(buffer->gpu);
-            wgpuBufferRelease(buffer->gpu);
-        }
+        // Release, never destroy: the GPU may still be reading this buffer
+        // from a submission in flight - our fence signals when a frame is
+        // recorded, not when the GPU has run it, so the game frees resources
+        // the queue still needs. Release lets WebGPU keep the buffer alive
+        // until that work is done and free it then; destroy pulls it out from
+        // under the queue ("Destroyed buffer used in a submit").
+        if (buffer->gpu) wgpuBufferRelease(buffer->gpu);
         delete buffer;
     });
 }
@@ -472,13 +507,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(
 
 VKAPI_ATTR void VKAPI_CALL vkDestroyImage(VkDevice, VkImage image, const VkAllocationCallbacks*) {
     if (!image || image->swapchain) return;
-    releaseLater([image] {
-        if (image->gpu) {
-            wgpuTextureDestroy(image->gpu);
-            wgpuTextureRelease(image->gpu);
-        }
-        delete image;
-    });
+    releaseImage(image);   // the app's own reference; freed once no view holds it
 }
 
 static void imageRequirements(const VkImage_T& img, VkMemoryRequirements& r) {
@@ -540,6 +569,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateImageView(
         VkDevice, const VkImageViewCreateInfo* ci, const VkAllocationCallbacks*, VkImageView* pView) {
     auto* v = new VkImageView_T();
     v->image = ci->image;
+    retainImage(v->image);
     v->viewType = ci->viewType;
     v->format = ci->format;
     v->range = ci->subresourceRange;
@@ -549,10 +579,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateImageView(
 
 VKAPI_ATTR void VKAPI_CALL vkDestroyImageView(VkDevice, VkImageView view, const VkAllocationCallbacks*) {
     if (!view) return;
-    releaseLater([view] {
-        if (view->gpu) wgpuTextureViewRelease(view->gpu);
-        delete view;
-    });
+    releaseView(view);   // the app's own reference; freed once no descriptor holds it
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateSampler(

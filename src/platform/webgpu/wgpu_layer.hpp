@@ -214,6 +214,7 @@ struct VkImage_T {
     VkImageCreateFlags flags = 0;
     WGPUTexture gpu = nullptr;
     VkSwapchainKHR_T* swapchain = nullptr;   // set for swapchain images
+    std::atomic<int> refs{1};                // live views + the app's handle; see releaseImage
 
     WGPUTexture ensureGpu();
 };
@@ -225,8 +226,36 @@ struct VkImageView_T {
     VkImageSubresourceRange range{};
     WGPUTextureView gpu = nullptr;
     uint64_t gpuFrame = 0;                   // swapchain frame the view is of
+    std::atomic<int> refs{1};                // descriptors that name it + the app's handle; see releaseView
 
     WGPUTextureView ensureGpu();
+};
+
+// Views and images are reference counted, so the game can destroy one while a
+// descriptor set still names it and a command recorded before the destroy but
+// not yet replayed still draws with it - which it does on every zone change. A
+// view holds a count on its image, a descriptor holds one on its view (via
+// ViewRef); each is torn down only once its last reference goes, the way a
+// native driver keeps a resource alive until its work is done.
+void retainImage(VkImage_T* image);
+void releaseImage(VkImage_T* image);
+void retainView(VkImageView_T* view);
+void releaseView(VkImageView_T* view);
+
+/// A counted handle to a view, so a descriptor keeps the view alive through
+/// every copy the descriptor arrays make of it.
+struct ViewRef {
+    VkImageView_T* p = nullptr;
+    ViewRef() = default;
+    ViewRef(VkImageView_T* v) : p(v) { retainView(p); }
+    ViewRef(const ViewRef& o) : p(o.p) { retainView(p); }
+    ViewRef(ViewRef&& o) noexcept : p(o.p) { o.p = nullptr; }
+    ViewRef& operator=(VkImageView_T* v) { retainView(v); releaseView(p); p = v; return *this; }
+    ViewRef& operator=(const ViewRef& o) { retainView(o.p); releaseView(p); p = o.p; return *this; }
+    ViewRef& operator=(ViewRef&& o) noexcept { if (this != &o) { releaseView(p); p = o.p; o.p = nullptr; } return *this; }
+    ~ViewRef() { releaseView(p); }
+    VkImageView_T* operator->() const { return p; }
+    operator VkImageView_T*() const { return p; }
 };
 
 struct VkSampler_T {
@@ -263,7 +292,7 @@ struct VkDescriptorSet_T {
         VkBuffer_T* buffer = nullptr;
         VkDeviceSize offset = 0;
         VkDeviceSize range = 0;
-        VkImageView_T* view = nullptr;
+        ViewRef view;
         VkSampler_T* sampler = nullptr;
     };
     VkDescriptorSetLayout_T* layout = nullptr;
@@ -478,8 +507,16 @@ void replay(const std::vector<VkCommandBuffer_T*>& buffers);
 void runOnMain(std::function<void()> fn);
 void drainMainQueue();
 
-/// Releases a WebGPU object on the main thread, whichever thread asks.
+/// Tears a resource down later, whichever thread asks. The teardown is
+/// parked and only run a few frames on (see retireFrame): the game destroys
+/// textures and buffers while the GPU, and our own replay, may still be using
+/// them, so - like a native driver - we hold them until nothing in flight can
+/// name them.
 void releaseLater(std::function<void()> fn);
+
+/// Advances the deferral by one frame, running whatever is now old enough to
+/// free. Called once a frame, at present, on the main thread.
+void retireFrame();
 
 /// Debug: logs frame WOWEE_CAPTURE_FRAME's canvas as a PNG (see capture.cpp).
 void maybeCapture(WGPUTexture texture, uint32_t width, uint32_t height, bool bgra);
