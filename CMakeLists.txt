@@ -1494,6 +1494,11 @@ if(EMSCRIPTEN)
     # web_data.cpp is a WasmFS backend, written against WasmFS's own headers.
     set_source_files_properties(src/platform/web_data.cpp PROPERTIES
         INCLUDE_DIRECTORIES "${EMSCRIPTEN_ROOT_PATH}/system/lib/wasmfs")
+    # miniaudio (only included here) mixes on a real-time AudioWorklet thread
+    # instead of the main thread, so audio does not break up when a frame keeps
+    # the main thread busy. Its link side is -sAUDIO_WORKLET/-sWASM_WORKERS.
+    set_source_files_properties(src/audio/audio_engine.cpp PROPERTIES
+        COMPILE_DEFINITIONS MA_ENABLE_AUDIO_WORKLETS)
 
     # Emits wowee.html + wowee.js + wowee.wasm + wowee.data.
     set_target_properties(wowee PROPERTIES SUFFIX ".html")
@@ -1506,8 +1511,14 @@ if(EMSCRIPTEN)
         -sMAXIMUM_MEMORY=4GB
         -sSTACK_SIZE=8MB
         # Lets the main thread suspend mid-call and give the browser its turn
-        # - how the world load shows its loading screen (web_frame.cpp).
+        # - how the world load shows its loading screen (web_frame.cpp). It
+        # also carries miniaudio's worklet-init emscripten_sleep, which would
+        # otherwise need -sASYNCIFY.
         -sJSPI
+        # The audio mixer runs on an AudioWorklet, off the main thread, on its
+        # own WASM Worker (see MA_ENABLE_AUDIO_WORKLETS above).
+        -sAUDIO_WORKLET=1
+        -sWASM_WORKERS=1
         # Workers made before main runs. One made later needs the main thread
         # to get back to the browser first, and a main thread waiting on that
         # very thread (the world load waits on its terrain workers) never

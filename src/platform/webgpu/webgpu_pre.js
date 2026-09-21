@@ -12,6 +12,12 @@
 // So: where the view is into memory that large, copy the part being used into
 // a small array of its own first. Chromium never takes this path.
 (function () {
+  // This --pre-js is also loaded into worker and audio-worklet scopes. WebGPU
+  // - and `self` - exist only where the device does (the main thread and the
+  // Web Workers), so there is nothing to wrap elsewhere. The audio worklet has
+  // no `self` and would otherwise throw here on load and never start, which
+  // silences the game (its mixer runs on that worklet).
+  if (typeof self === 'undefined' || typeof self.GPUQueue === 'undefined') return;
   // Only once a browser has refused one: copying costs a small array per call,
   // thousands of calls a frame, and Chromium - which takes the views as they
   // are - would pay it for nothing.
@@ -84,6 +90,7 @@ if (typeof navigator !== 'undefined' && navigator.hardwareConcurrency > 8) {
   Object.defineProperty(navigator, 'hardwareConcurrency', { value: 8, configurable: true });
 }
 
+if (typeof Module !== 'undefined') {
 Module['preRun'] = Module['preRun'] || [];
 Module['preRun'].push(function () {
   // ?capture=N logs frame N as a PNG (see capture.cpp).
@@ -170,3 +177,4 @@ Module['preRun'].push(function () {
     if (Module['setStatus']) Module['setStatus'](String(e));
   });
 });
+}
