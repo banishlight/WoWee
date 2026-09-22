@@ -258,7 +258,7 @@ void main() {
         }
 
         if (shadowParams.x > 0.5) {
-            float normalOffset = shadowTexel() * 2.0 * (1.0 - abs(dot(norm, ldir)));
+            float normalOffset = shadowParams.w * 2.0 * (1.0 - abs(dot(norm, ldir)));
             vec3 biasedPos = FragPos + norm * normalOffset;
             vec4 lsPos = lightSpaceMatrix * vec4(biasedPos, 1.0);
             vec3 proj = lsPos.xyz / lsPos.w;

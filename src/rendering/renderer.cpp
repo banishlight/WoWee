@@ -468,8 +468,14 @@ void Renderer::updatePerFrameUBO() {
     float shadowBias = glm::clamp(0.8f * (shadowDistance_ / 300.0f), 0.0f, 1.0f);
     // z carries one texel of the shadow map. The shaders used to hold that as
     // a constant for 4096, and the map is 512 to 4096 by the quality level.
+    // w carries the world-space size of one shadow-map texel, so the shaders'
+    // normal-offset bias is in the units it is added in (world space). It used
+    // to reuse z (a UV texel, ~1/2048), which as a world distance is a few
+    // hundredths of an inch - no bias at all, which is what let the whole
+    // ground self-shadow into a flat grey.
+    const float shadowWorldTexel = (2.0f * shadowDistance_) / static_cast<float>(SHADOW_MAP_SIZE);
     currentFrameData.shadowParams = glm::vec4(shadowsEnabled ? 1.0f : 0.0f, shadowBias,
-                                              1.0f / static_cast<float>(SHADOW_MAP_SIZE), 0.0f);
+                                              1.0f / static_cast<float>(SHADOW_MAP_SIZE), shadowWorldTexel);
 
     for (uint32_t i = 0; i < MAX_LOCAL_LIGHTS; ++i) {
         currentFrameData.localLightPosRadius[i] = glm::vec4(0.0f);
@@ -3732,9 +3738,15 @@ void Renderer::renderHUD() {
 
 glm::mat4 Renderer::computeLightSpaceMatrix() {
     const float kShadowHalfExtent = shadowDistance_;
-    const float kShadowLightDistance = shadowDistance_ * 3.0f;
-    constexpr float kShadowNearPlane = 1.0f;
-    const float kShadowFarPlane = shadowDistance_ * 6.5f;
+    // Near/far bracket the geometry instead of enclosing a slab many times its
+    // depth. The old 1..6.5x range put the whole scene in a ~0.05 slice of the
+    // depth buffer, so no depth bias had a workable window - too little left
+    // acne, too much detached the shadow. Light at 2x keeps the near plane
+    // clear of tall casters; the +/-1.75x band around it covers the footprint
+    // and its relief.
+    const float kShadowLightDistance = shadowDistance_ * 2.0f;
+    const float kShadowNearPlane = shadowDistance_ * 0.25f;
+    const float kShadowFarPlane = shadowDistance_ * 3.75f;
 
     // Use active lighting direction so shadow projection matches main shading.
     // Fragment shaders derive lighting with `ldir = normalize(-lightDir.xyz)`,
