@@ -765,10 +765,23 @@ bool M2Renderer::initialize(VkContext* ctx, VkDescriptorSetLayout perFrameLayout
             VkComputePipelineCreateInfo cpCi{.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
             cpCi.stage = cullComp.stageInfo(VK_SHADER_STAGE_COMPUTE_BIT);
             cpCi.layout = cullPipelineLayout_;
+#ifdef __EMSCRIPTEN__
+            // GPU culling writes visibility[] for the CPU to read back, and the
+            // WebGPU layer has no GPU->CPU buffer readback (see resources.cpp
+            // vkInvalidateMappedMemoryRanges). Left on, the CPU reads a stale
+            // "culled" for every instance and all world doodads - fences, spire
+            // decorations, ground clutter - vanish. So the web build leaves the
+            // pipeline null; dispatchCullCompute() then early-outs and the
+            // renderer uses its CPU frustum+distance cull fallback instead.
+            (void)cpCi;
+            cullPipeline_ = VK_NULL_HANDLE;
+            LOG_WARNING("M2Renderer: GPU culling off on web (no GPU->CPU readback); CPU cull in use");
+#else
             if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpCi, nullptr, &cullPipeline_) != VK_SUCCESS) {
                 LOG_ERROR("M2Renderer: failed to create cull compute pipeline");
                 cullPipeline_ = VK_NULL_HANDLE;
             }
+#endif
             cullComp.destroy();
         }
 
