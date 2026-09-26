@@ -394,9 +394,8 @@ VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFormatProperties(
     } else if (info.blockDim == 1 && format != VK_FORMAT_R16_SNORM) {
         f |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
         if (!isInteger) f |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
-        if (format == VK_FORMAT_R32_SFLOAT || format == VK_FORMAT_R32_UINT ||
-            format == VK_FORMAT_R16G16B16A16_SFLOAT || format == VK_FORMAT_R8G8B8A8_UNORM ||
-            format == VK_FORMAT_R32G32B32A32_SFLOAT || format == VK_FORMAT_R32G32_SFLOAT) {
+        // Vulkan storage is read-write, which WebGPU allows only for these.
+        if (format == VK_FORMAT_R32_SFLOAT || format == VK_FORMAT_R32_UINT) {
             f |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
         }
     }
