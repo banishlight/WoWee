@@ -2567,7 +2567,13 @@ void SocialHandler::handleGuildEvent(network::Packet& packet) {
     GuildEventData data;
     if (!GuildEventParser::parse(packet, data)) return;
 
+    // What the game prints for each, in its own words (ERR_GUILD_* and the
+    // friend list's online and offline lines) and as a system line. These went
+    // out as guild chat with no sender, and the interface puts the player's own
+    // name on a local line without one: "[Guild] [You]: [Guild] Coggs has come
+    // online."
     std::string msg;
+    bool guildLine = false;  // the MOTD, which is the one that is guild chat
     switch (data.eventType) {
         case GuildEvent::PROMOTION:
             if (data.numStrings >= 3)
@@ -2581,8 +2587,10 @@ void SocialHandler::handleGuildEvent(network::Packet& packet) {
             // The interface writes this one itself, from the GUILD_MOTD event
             // fired further down: chatframe.lua formats GUILD_MOTD_TEMPLATE
             // and adds it. Only the client's own window needs a line here.
-            if (data.numStrings >= 1 && !ui::frameXmlOwns(ui::UiElement::Chat))
-                msg = "Guild MOTD: " + data.strings[0];
+            if (data.numStrings >= 1 && !ui::frameXmlOwns(ui::UiElement::Chat)) {
+                msg = "Guild Message of the Day: " + data.strings[0];
+                guildLine = true;
+            }
             break;
         case GuildEvent::JOINED:
             if (data.numStrings >= 1) msg = data.strings[0] + " has joined the guild.";
@@ -2591,13 +2599,15 @@ void SocialHandler::handleGuildEvent(network::Packet& packet) {
             if (data.numStrings >= 1) msg = data.strings[0] + " has left the guild.";
             break;
         case GuildEvent::REMOVED:
-            if (data.numStrings >= 2) msg = data.strings[1] + " has been kicked from the guild by " + data.strings[0] + ".";
+            // The member removed, then who removed them - the order the server
+            // sends and ERR_GUILD_REMOVE_SS reads them in.
+            if (data.numStrings >= 2) msg = data.strings[0] + " has been kicked out of the guild by " + data.strings[1] + ".";
             break;
         case GuildEvent::LEADER_IS:
-            if (data.numStrings >= 1) msg = data.strings[0] + " is the guild leader.";
+            if (data.numStrings >= 1) msg = data.strings[0] + " is the leader of your guild.";
             break;
         case GuildEvent::LEADER_CHANGED:
-            if (data.numStrings >= 2) msg = data.strings[0] + " has made " + data.strings[1] + " the new guild leader.";
+            if (data.numStrings >= 2) msg = data.strings[0] + " has made " + data.strings[1] + " the new Guild Master.";
             break;
         case GuildEvent::DISBANDED:
             msg = "Guild has been disbanded.";
@@ -2620,12 +2630,12 @@ void SocialHandler::handleGuildEvent(network::Packet& packet) {
             // player's idea of what is worth reading.
             if (data.numStrings >= 1 && guildMemberOnlineTransition(data.strings[0], true) &&
                 addons::storedCVarValue("guildMemberNotify", "1") != "0")
-                msg = "[Guild] " + data.strings[0] + " has come online.";
+                msg = "|Hplayer:" + data.strings[0] + "|h[" + data.strings[0] + "]|h has come online.";
             break;
         case GuildEvent::SIGNED_OFF:
             if (data.numStrings >= 1 && guildMemberOnlineTransition(data.strings[0], false) &&
                 addons::storedCVarValue("guildMemberNotify", "1") != "0")
-                msg = "[Guild] " + data.strings[0] + " has gone offline.";
+                msg = data.strings[0] + " has gone offline.";
             break;
         // The bank's half of the event list. The server broadcasts these to
         // every member whenever anyone touches the bank, so they are frequent,
@@ -2664,7 +2674,7 @@ void SocialHandler::handleGuildEvent(network::Packet& packet) {
 
     if (!msg.empty()) {
         MessageChatData chatMsg;
-        chatMsg.type = ChatType::GUILD;
+        chatMsg.type = guildLine ? ChatType::GUILD : ChatType::SYSTEM;
         chatMsg.language = ChatLanguage::UNIVERSAL;
         chatMsg.message = msg;
         owner_.addLocalChatMessage(chatMsg);
@@ -4595,17 +4605,25 @@ void SocialHandler::handleInitializeFactions(network::Packet& packet) {
     // moved. The reputation tab drew every bar empty at Neutral however much
     // the character had earned, and so did this client's own panel and the
     // watched-faction bar, all three reading the same empty map.
+    //
+    // And each made whole: the packet carries what has been earned, and the
+    // standing is that on top of where the faction starts for this race and
+    // class. See factionBaseReputation.
     owner_.loadFactionNameCache();
     for (size_t repListId = 0; repListId < owner_.initialFactionsRef().size(); ++repListId) {
         const uint32_t factionId =
             owner_.getFactionIdByRepListId(static_cast<uint32_t>(repListId));
         if (factionId == 0) continue;
-        owner_.factionStandingsRef()[factionId] =
-            owner_.initialFactionsRef()[repListId].standing;
+        auto& standing = owner_.initialFactionsRef()[repListId].standing;
+        standing += owner_.factionBaseReputation(factionId);
+        owner_.factionStandingsRef()[factionId] = standing;
     }
     LOG_INFO("Reputation: ", owner_.initialFactionsRef().size(),
              " factions initialised, ", owner_.factionStandingsRef().size(),
              " resolved to a faction id");
+    // Whether each faction with a standing is hostile is the at-war flag this
+    // packet carries, so units judged before it arrived are judged again.
+    owner_.refreshUnitHostility();
 }
 
 void SocialHandler::handleSetFactionStanding(network::Packet& packet) {
@@ -4640,6 +4658,8 @@ void SocialHandler::handleSetFactionStanding(network::Packet& packet) {
                         " standing=", standing);
             continue;
         }
+        // Earned only, as at login: the whole is this on top of the start.
+        standing += owner_.factionBaseReputation(factionId);
 
         int32_t  oldStanding = 0;
         // SMSG_INITIALIZE_FACTIONS is indexed by ReputationListID and supplies the
@@ -4678,6 +4698,7 @@ void SocialHandler::handleSetFactionAtWar(network::Packet& packet) {
             owner_.initialFactionsRef()[repListId].flags |=  GameHandler::FACTION_FLAG_AT_WAR;
         else
             owner_.initialFactionsRef()[repListId].flags &= ~GameHandler::FACTION_FLAG_AT_WAR;
+        owner_.refreshUnitHostility();
     }
 }
 

@@ -243,4 +243,9 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(
     return VK_SUCCESS;
 }
 
+// Dynamic rendering is never advertised, so these are never called; the
+// renderer only links against them.
+VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(VkCommandBuffer, const VkRenderingInfo*) {}
+VKAPI_ATTR void VKAPI_CALL vkCmdEndRendering(VkCommandBuffer) {}
+
 } // extern "C"

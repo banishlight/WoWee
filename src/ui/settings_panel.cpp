@@ -124,11 +124,6 @@ void SettingsPanel::renderSettingsGameplayTab(const std::function<void()>& saveC
     ImGui::BeginChild("GameplaySettings", ImVec2(0, -1), true);
 
     ImGui::SeparatorText("Camera");
-    ImGui::SetNextItemWidth(200.0f);
-    if (ImGui::SliderFloat("Mouse Sensitivity", &pendingMouseSensitivity, 0.05f, 1.0f, "%.2f")) {
-        applySettingSideEffects("mousespeed");
-        saveCallback();
-    }
     drawSchemaCategory("Camera", saveCallback);
 
     // What the pad does, said where the pad's settings are.
@@ -163,12 +158,12 @@ void SettingsPanel::renderSettingsGameplayTab(const std::function<void()>& saveC
             listRow(row);
         }
         ImGui::BulletText("%s or %s: close a window, or the game menu",
-                          padButtonLabel(SDL_CONTROLLER_BUTTON_B, kind),
-                          padButtonLabel(SDL_CONTROLLER_BUTTON_START, kind));
+                          padButtonLabel(SDL_GAMEPAD_BUTTON_EAST, kind),
+                          padButtonLabel(SDL_GAMEPAD_BUTTON_START, kind));
         ImGui::BulletText("%s: the pointer - then %s clicks and %s right-clicks",
-                          padButtonLabel(SDL_CONTROLLER_BUTTON_BACK, kind),
-                          padButtonLabel(SDL_CONTROLLER_BUTTON_A, kind),
-                          padButtonLabel(SDL_CONTROLLER_BUTTON_X, kind));
+                          padButtonLabel(SDL_GAMEPAD_BUTTON_BACK, kind),
+                          padButtonLabel(SDL_GAMEPAD_BUTTON_SOUTH, kind),
+                          padButtonLabel(SDL_GAMEPAD_BUTTON_WEST, kind));
         if (core::gamepad().hasTouchpad()) {
             ImGui::BulletText("Touchpad: a trackpad - click it, or with two "
                               "fingers to right-click");
@@ -212,12 +207,9 @@ void SettingsPanel::renderSettingsGameplayTab(const std::function<void()>& saveC
                                      "Gameplay", "Chat"}) {
             restoreSchemaDefaults(category);
         }
-        // Two the schema cannot hold. Mouse look speed belongs to the game's
-        // own Interface panel, and the bag scale's default depends on the
+        // One the schema cannot hold: the bag scale's default depends on the
         // display it is being shown on - a constant would make the bags small
         // on a large screen, which is what the recommendation exists to avoid.
-        pendingMouseSensitivity = 0.2f;
-        applySettingSideEffects("mousespeed");
         pendingBagScale =
             recommendedPixelScale(ImGui::GetIO().DisplaySize.y, 0.75f, 1.5f);
         applySettingSideEffects("bagscale");
@@ -594,6 +586,10 @@ void SettingsPanel::renderSettingsWindow(ChatPanel& chatPanel,
                 drawSchemaCategory("Grass", saveCallback);
 
                 ImGui::Spacing();
+                ImGui::SeparatorText("Ray Tracing (highly experimental)");
+                drawSchemaCategory("Ray Tracing", saveCallback);
+
+                ImGui::Spacing();
                 ImGui::SeparatorText("Upscaling");
                 drawSchemaCategory("Upscaling", saveCallback);
                 // Not settings: what the machine can actually do, which is the
@@ -627,7 +623,7 @@ void SettingsPanel::renderSettingsWindow(ChatPanel& chatPanel,
                 if (ImGui::Button("Restore Video Defaults", ImVec2(-1, 0))) {
                     // Three categories, because the settings window puts on one
                     // tab what the options panels put on three.
-                    for (const char* category : {"Graphics", "Detail", "Upscaling", "Display"}) {
+                    for (const char* category : {"Graphics", "Detail", "Ray Tracing", "Upscaling", "Display"}) {
                         restoreSchemaDefaults(category);
                     }
                     // Only the resolution is outside the schema now: it is the
@@ -862,7 +858,8 @@ constexpr const char* kGraphicsApplyKeys[] = {
     "grassdistance", "waterrefraction", "upscaling", "fsrquality",
     "fsrsharpness", "framegen", "brightness", "uiopacity", "minimapsquare",
     "minimapnpcdots", "minimapclock", "minimapcoords", "minimaprotate", "latencymeter",
-    "fogskyblend", "fogstrength", "sharpstars",
+    "fogskyblend", "fogstrength", "sharpstars", "lightshafts", "mistdensity", "sunshafts",
+    "raytracedlighting",
     // Moved off the game's own Effects panel, so this list is now what
     // applies them at startup; the cvar store used to do it.
     "groundclutterdistance", "particledensity", "weatherdetail",
@@ -919,7 +916,15 @@ void SettingsPanel::applyGraphicsPreset(GraphicsPreset preset) {
         // Each one goes to the thing it affects through the one function that
         // knows where that is, rather than through a second copy of the same
         // renderer calls written out here.
-        for (const char* key : kGraphicsPresetKeys) applySettingSideEffects(key);
+        //
+        // And to the CVar store, as setSettingValue does: view distance and
+        // ground clutter are bound to CVars, the store is applied over the
+        // settings file at start-up, and a preset that left it alone was
+        // undone at the next start.
+        for (const char* key : kGraphicsPresetKeys) {
+            applySettingSideEffects(key);
+            addons::noteClientSettingChanged(key, settingValue(key));
+        }
     }
 
     currentGraphicsPreset = preset;
@@ -996,6 +1001,9 @@ constexpr FieldBinding kFieldBindings[] = {
     {.key = "viewdistance",   .asFloat = &SettingsPanel::pendingViewDistance},
     {.key = "fogskyblend",    .asFloat = &SettingsPanel::pendingFogSkyBlend},
     {.key = "fogstrength",    .asFloat = &SettingsPanel::pendingFogStrength},
+    {.key = "lightshafts",    .asInt   = &SettingsPanel::pendingVolumetricFog},
+    {.key = "raytracedlighting", .asInt = &SettingsPanel::pendingRtLighting},
+    {.key = "mistdensity",    .asFloat = &SettingsPanel::pendingVolumetricDensity},
     {.key = "mousespeed",     .asFloat = &SettingsPanel::pendingMouseSensitivity},
     {.key = "minimapclock",   .asBool  = &SettingsPanel::pendingShowMinimapClock},
     {.key = "friendlyplates", .asBool  = &SettingsPanel::showFriendlyNameplates_},
@@ -1040,6 +1048,7 @@ constexpr FieldBinding kFieldBindings[] = {
     {.key = "framecap",          .asInt   = &SettingsPanel::pendingFrameCap},
     {.key = "parallax",          .asBool  = &SettingsPanel::pendingPOM},
     {.key = "sharpstars",        .asBool  = &SettingsPanel::pendingSharpStars},
+    {.key = "sunshafts",         .asBool  = &SettingsPanel::pendingSunShafts},
     {.key = "parallaxquality",   .asInt   = &SettingsPanel::pendingPOMQuality},
 
     // --- Upscaling ---
@@ -1052,6 +1061,7 @@ constexpr FieldBinding kFieldBindings[] = {
     // --- Display ---
     {.key = "fullscreen", .asBool = &SettingsPanel::pendingFullscreen},
     {.key = "vsync",      .asBool = &SettingsPanel::pendingVsync},
+    {.key = "mapwindow",  .asBool = &SettingsPanel::showMapWindow_},
     {.key = "brightness", .asInt  = &SettingsPanel::pendingBrightness},
 
     // --- Camera ---
@@ -1071,7 +1081,9 @@ constexpr FieldBinding kFieldBindings[] = {
     // --- Interface ---
     {.key = "uiopacity",     .asInt   = &SettingsPanel::pendingUiOpacity},
     {.key = "windowuiscale", .asFloat = &SettingsPanel::pendingWindowUiScale},
+    {.key = "scrollspeed",   .asFloat = &SettingsPanel::pendingScrollSpeed},
     {.key = "latencymeter",  .asBool  = &SettingsPanel::pendingShowLatencyMeter},
+    {.key = "checkforupdates",   .asBool  = &SettingsPanel::pendingCheckForUpdates},
     {.key = "micromenu",     .asBool  = &SettingsPanel::pendingShowMicroMenu},
     {.key = "chatboxvisible", .asBool = &SettingsPanel::pendingChatBoxVisible},
     {.key = "bagscale",      .asFloat = &SettingsPanel::pendingBagScale},
@@ -1121,6 +1133,7 @@ constexpr FieldBinding kFieldBindings[] = {
 
     // --- Gameplay ---
     {.key = "autoloot",     .asBool = &SettingsPanel::pendingAutoLoot},
+    {.key = "autofacetarget", .asBool = &SettingsPanel::pendingAutoFaceTarget},
     {.key = "autosellgrey", .asBool = &SettingsPanel::pendingAutoSellGrey},
     {.key = "autorepair",   .asBool = &SettingsPanel::pendingAutoRepair},
     {.key = "secureabilitytoggle", .asBool = &SettingsPanel::pendingSecureAbilityToggle},
@@ -1347,6 +1360,8 @@ void SettingsPanel::applySettingSideEffects(const std::string& key) {
         if (chars) chars->setPOMEnabled(pendingPOM);
     } else if (key == "sharpstars") {
         if (renderer) renderer->setSharpStars(pendingSharpStars);
+    } else if (key == "sunshafts") {
+        if (renderer) renderer->setSunShaftsEnabled(pendingSunShafts);
     } else if (key == "parallaxquality") {
         if (wmo) wmo->setPOMQuality(pendingPOMQuality);
         if (chars) chars->setPOMQuality(pendingPOMQuality);
@@ -1377,6 +1392,12 @@ void SettingsPanel::applySettingSideEffects(const std::string& key) {
                 lighting->setFogStrength(pendingFogStrength);
             }
         }
+    } else if (key == "lightshafts") {
+        if (renderer) renderer->setVolumetricFogQuality(pendingVolumetricFog);
+    } else if (key == "raytracedlighting") {
+        if (renderer) renderer->setRtLightingMode(pendingRtLighting);
+    } else if (key == "mistdensity") {
+        if (renderer) renderer->setVolumetricFogDensity(pendingVolumetricDensity);
     } else if (key == "fogskyblend") {
         if (renderer) {
             if (auto* lighting = renderer->getLightingManager()) {

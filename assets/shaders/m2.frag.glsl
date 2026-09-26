@@ -16,7 +16,13 @@ layout(set = 0, binding = 0) uniform PerFrame {
     vec4 localLightPosRadius[64];
     vec4 localLightColorIntensity[64];
     ivec4 localLightMeta;
+    vec4 volumetricParams;  // x = on, y = near, z = 1 / ln(far / near), w = slices
+    mat4 rtViewProj;
+    vec4 rtCameraPos;
+    vec4 rtParams;
 };
+
+#include "rt_lighting.glsli"
 
 layout(set = 1, binding = 0) uniform sampler2D uTexture;
 
@@ -39,6 +45,7 @@ layout(set = 1, binding = 2) uniform M2Material {
 };
 
 layout(set = 0, binding = 1) uniform sampler2DShadow uShadowMap;
+layout(set = 0, binding = 2) uniform sampler3D uFogVolume;
 
 layout(location = 0) in vec3 FragPos;
 layout(location = 1) in vec3 Normal;
@@ -123,6 +130,39 @@ float beamHaze(vec3 p) {
                    mix(beamHash(i + vec3(0, 1, 1)), beamHash(i + vec3(1, 1, 1)), f.x), f.y), f.z);
 }
 
+// The air between the camera and this point, out of the fog volume: rgb is
+// the light it scatters toward the camera, a how much of the point shows
+// through it. See VolumetricFog.
+vec4 fogVolumeAt(vec3 worldPos) {
+    vec4 clip = projection * view * vec4(worldPos, 1.0);
+    float depth = max(clip.w, 1e-4);
+    vec2 uv = clip.xy / depth * 0.5 + 0.5;
+    float slice = log(max(depth, volumetricParams.y) / volumetricParams.y) * volumetricParams.z;
+    // Each slice holds the air up to its far edge, so a point is read half a
+    // slice back from where it stands.
+    return textureLod(uFogVolume, vec3(uv, slice - 0.5 / volumetricParams.w), 0.0);
+}
+
+// The zone's distance fog, then the air in front of it. The distance fog is
+// the far haze the sky is painted to meet, so it goes on first; the volume is
+// everything between the camera and that, sunlit shafts and torch glow
+// included.
+vec3 applyFog(vec3 color, vec3 worldPos, float dist) {
+    float fogFactor = clamp((fogParams.y - dist) / (fogParams.y - fogParams.x), 0.0, 1.0);
+    color = mix(fogColor.rgb, color, fogFactor);
+    if (volumetricParams.x > 0.5) {
+        vec4 air = fogVolumeAt(worldPos);
+        color = color * air.a + air.rgb;
+    }
+    return color;
+}
+
+// The whole depth of the fog volume at this point of the screen, for the sky:
+// it lies behind everything, so it takes all the air there is.
+vec4 fogVolumeSky(vec2 uv) {
+    return textureLod(uFogVolume, vec3(uv, 1.0), 0.0);
+}
+
 void main() {
     vec4 texColor = hasTexture != 0 ? texture(uTexture, TexCoord) : vec4(1.0);
     // The batch's authored colour. A glow card is painted white and coloured
@@ -148,7 +188,20 @@ void main() {
     // and stood still when it did not, on its blended layers alone. The rescale
     // is for foliage cutouts, where a hard edge is the point.
     if (vSkyMode != 0) {
-        outColor = vec4(texColor.rgb, texColor.a * vFadeAlpha);
+        // An opaque layer's alpha channel says nothing - it was never
+        // blended - so only the fade is its alpha. That matters while the
+        // sky crossfades between zones, when every layer is drawn blended.
+        float skyAlpha = (blendMode == 0) ? 1.0 : texColor.a;
+        // Behind all the air there is, as the procedural sky is. An
+        // additive layer only loses what the air hides of it; the air's own
+        // light is already in the layer it is added to.
+        vec3 skyColor = texColor.rgb;
+        if (volumetricParams.x > 0.5) {
+            vec4 clip = projection * view * vec4(FragPos, 1.0);
+            vec4 air = fogVolumeSky(clip.xy / max(clip.w, 1e-4) * 0.5 + 0.5);
+            skyColor = (blendMode >= 3) ? skyColor * air.a : skyColor * air.a + air.rgb;
+        }
+        outColor = vec4(skyColor, skyAlpha * vFadeAlpha);
         return;
     }
 
@@ -284,7 +337,9 @@ void main() {
         // Sky-bounce ambient for foliage: upward-facing leaves catch more
         // ambient than the canopy underside, giving the crown depth instead
         // of a uniformly-lit blob.
-        vec3 ambientTerm = ambientColor.rgb;
+        RtLight rt = rtLightAt(FragPos);
+        shadow = rtShadow(rt, shadow);
+        vec3 ambientTerm = rtAmbient(rt, ambientColor.rgb);
         if (isFoliage) {
             ambientTerm *= 0.82 + 0.30 * clamp(norm.z, 0.0, 1.0);
         }
@@ -310,16 +365,19 @@ void main() {
     if (unlit == 0) result += localLightContribution(FragPos, norm, texColor.rgb);
 
     float dist = length(viewPos.xyz - FragPos);
-    float fogFactor = clamp((fogParams.y - dist) / (fogParams.y - fogParams.x), 0.0, 1.0);
     if (blendMode >= 3) {
         // Additive. Mixing toward the fog colour would give the card's black
         // corners the fog's colour, and additive then adds that to the scene -
         // the whole quad shows up as a lit rectangle hanging in the air, which
         // is what Orgrimmar's bonfire glow was doing to the wall behind it.
-        // Distance can only take an additive contribution away.
+        // Distance can only take an additive contribution away, and so can
+        // the air in front of it: its own light is already in the scene
+        // behind the card.
+        float fogFactor = clamp((fogParams.y - dist) / (fogParams.y - fogParams.x), 0.0, 1.0);
         result *= fogFactor;
+        if (volumetricParams.x > 0.5) result *= fogVolumeAt(FragPos).a;
     } else {
-        result = mix(fogColor.rgb, result, fogFactor);
+        result = applyFog(result, FragPos, dist);
     }
 
     float outAlpha = texColor.a * vFadeAlpha;

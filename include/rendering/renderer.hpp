@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <string>
 #include <cstdint>
@@ -16,6 +17,7 @@
 #include "rendering/vk_frame_data.hpp"
 #include "rendering/vk_utils.hpp"
 #include "rendering/sky_system.hpp"
+#include "core/screen_recorder.hpp"
 #include "pipeline/custom_zone_discovery.hpp"
 
 #include "pipeline/grass_biomes.hpp"
@@ -70,6 +72,12 @@ class RenderGraph;
 class OverlaySystem;
 class HiZSystem;
 class GrassRenderer;
+class VolumetricFog;
+class RtScene;
+class RtLighting;
+class LootSparkles;
+class SunShafts;
+class ScreenCapture;
 
 class Renderer {
 public:
@@ -81,6 +89,13 @@ public:
 
     void beginFrame();
     void endFrame();
+
+    /// Recorded after the interface is drawn and before the frame is submitted,
+    /// into the frame's own command buffer. A second window draws here - see
+    /// AuxSwapchain - so the frame's one fence covers it. Empty clears it.
+    void setAfterInterfaceRecorder(std::function<void(VkCommandBuffer)> recorder) {
+        afterInterface_ = std::move(recorder);
+    }
 
     void renderWorld(game::World* world, game::GameHandler* gameHandler = nullptr);
 
@@ -157,6 +172,13 @@ public:
     bool isPlayerIndoors() const { return playerIndoors_; }
     VkContext* getVkContext() const { return vkCtx; }
     VkDescriptorSetLayout getPerFrameSetLayout() const { return perFrameSetLayout; }
+    /// What a per-frame set allocated elsewhere binds at binding 2: a fog
+    /// volume of clear air, for a set whose block leaves the fog off.
+    VkImageView getNeutralFogVolumeView() const;
+    /// What a per-frame set allocated elsewhere binds at 3 and 4.
+    VkImageView getNeutralRtLightingView() const;
+    /// The geometry the ray traced lighting sees; renderers register with it.
+    RtScene* getRtScene() const { return rtScene_.get(); }
     VkRenderPass getShadowRenderPass() const { return shadowRenderPass; }
 
     // Third-person character follow
@@ -169,6 +191,17 @@ public:
     // Screenshot capture - copies swapchain image to PNG file
     bool captureScreenshot(const std::string& outputPath);
 
+    /// Start writing the screen, interface included, and what the client
+    /// plays to a video file. False, with the reason in error, when it cannot.
+    bool startRecording(const std::string& path, std::string& error);
+    /// Finish the file and close it.
+    core::ScreenRecorder::Stats stopRecording();
+    [[nodiscard]] bool isRecording() const;
+    /// Why a recording stopped by itself - the disk filled, the encoder gave
+    /// up - once, for the interface to say; empty otherwise. The file is
+    /// finished properly all the same.
+    std::string takeRecordingFailure();
+
     // Spell visual effects (SMSG_PLAY_SPELL_VISUAL / SMSG_PLAY_SPELL_IMPACT)
     // Delegates to SpellVisualSystem (owned by Renderer)
     SpellVisualSystem* getSpellVisualSystem() const { return spellVisualSystem_.get(); }
@@ -179,6 +212,7 @@ public:
     // Sub-system accessors (§4.2)
     AnimationController* getAnimationController() const { return animationController_.get(); }
     LevelUpEffect* getLevelUpEffect() const { return levelUpEffect.get(); }
+    LootSparkles* getLootSparkles() const { return lootSparkles_.get(); }
     ChargeEffect* getChargeEffect() const { return chargeEffect.get(); }
     SwimEffects* getSwimEffects() const { return swimEffects.get(); }
 
@@ -202,6 +236,8 @@ public:
     const std::vector<pipeline::CustomZoneInfo>& getCustomZones() const { return customZones_; }
 
 private:
+    std::function<void(VkCommandBuffer)> afterInterface_;
+
     // True when water is drawn in the scene continuation pass rather than in
     // the scene pass itself (see renderWorld).
     bool waterDrawsInContinuePass() const;
@@ -263,6 +299,7 @@ private:
     std::unique_ptr<SwimEffects> swimEffects;
     std::unique_ptr<MountDust> mountDust;
     std::unique_ptr<LevelUpEffect> levelUpEffect;
+    std::unique_ptr<LootSparkles> lootSparkles_;
     std::unique_ptr<ChargeEffect> chargeEffect;
     std::unique_ptr<CharacterRenderer> characterRenderer;
     std::unique_ptr<WMORenderer> wmoRenderer;
@@ -278,12 +315,18 @@ private:
     /// continent change rather than held across one.
     mutable uint32_t lastResolvedZoneMapId_ = 0xFFFFFFFFu;
 
-    std::string skyboxModelPath_;
-    uint32_t skyboxModelInstanceId_ = 0;
-    /// Sky paths that did not resolve to a usable model. The swap is atomic -
-    /// the old sky is kept when a new one cannot be loaded - so without this
-    /// the failing path would be read off disk again on every frame it was
-    /// active.
+    /// The original client's sky models that are up, one instance each, faded
+    /// by the weight LightingManager gives them. See updateSkyboxLayers.
+    struct SkyLayerInstance {
+        std::string path;
+        uint32_t instanceId = 0;
+    };
+    std::vector<SkyLayerInstance> skyLayers_;
+    /// Sky models already uploaded, by path, so one that fades out and back in
+    /// is not read off disk again.
+    std::unordered_map<std::string, uint32_t> loadedSkyModels_;
+    /// Sky paths that did not resolve to a usable model, so a failing path is
+    /// not read off disk again on every frame it is wanted.
     std::unordered_set<std::string> failedSkyboxPaths_;
     std::unique_ptr<Minimap> minimap;
     std::unique_ptr<WorldMap> worldMap;
@@ -352,6 +395,17 @@ public:
     void logViewDistanceDiag();
     void setSharpStars(bool enabled);
     bool areSharpStars() const { return sharpStars_; }
+    /// Fog lit by the sun through the shadow map and by nearby torches: 0 is
+    /// off, 1-3 the volume's resolution. Applied at the start of the next
+    /// frame. See VolumetricFog.
+    void setVolumetricFogQuality(int quality);
+    /// Ray traced lighting: 0 off, 1 sun shadows, 2 + ambient occlusion,
+    /// 3 + one-bounce diffuse. See RtLighting.
+    void setRtLightingMode(int mode);
+    /// A multiplier on how thick that air is; 1 is the default mist.
+    void setVolumetricFogDensity(float density) { volumetricFogDensity_ = glm::clamp(density, 0.0f, 3.0f); }
+    /// Rays streaming from the sun across the finished picture. See SunShafts.
+    void setSunShaftsEnabled(bool enabled) { sunShaftsEnabled_ = enabled; }
     int getTerrainLoadRadius() const;
     int getTerrainUnloadRadius() const { return getTerrainLoadRadius() + 3; }
     void setMsaaSamples(VkSampleCountFlagBits samples);
@@ -365,7 +419,8 @@ public:
 
 private:
     void applyMsaaChange();
-    bool ensureSkyboxModel();
+    bool updateSkyboxLayers();
+    uint32_t loadSkyboxModel(const std::string& path);
     VkSampleCountFlagBits pendingMsaaSamples_ = VK_SAMPLE_COUNT_1_BIT;
     bool msaaChangePending_ = false;
     void renderShadowPass();
@@ -487,6 +542,47 @@ private:
 
     // HiZ occlusion culling - builds depth pyramid each frame
     std::unique_ptr<HiZSystem> hizSystem_;
+
+    // Volumetric fog: a froxel volume built after the shadow pass and read by
+    // every world shader through set 0 binding 2.
+    std::unique_ptr<VolumetricFog> volumetricFog_;
+    // Ray traced lighting. Created with the per-frame resources and destroyed
+    // after every renderer that registers geometry with the scene.
+    std::unique_ptr<RtScene> rtScene_;
+    std::unique_ptr<RtLighting> rtLighting_;
+    void writeRtLightingBindings();
+    VkExtent2D sceneRenderExtent() const;
+    void recordRtLighting(VkImage sceneDepth, VkExtent2D sceneExtent, bool depthIsMsaa);
+    bool rtRecordedThisFrame_ = false;
+    float volumetricFogDensity_ = 1.0f;
+    /// Whether this frame builds the volume, decided where the per-frame block
+    /// is written so the block's switch and the dispatch cannot disagree.
+    bool volumetricThisFrame_ = false;
+    /// The ground the mist lies on, chased toward the ground under the player.
+    float fogLayerBase_ = 0.0f;
+    bool fogLayerBaseValid_ = false;
+    /// The extinction the volume is built with, chased toward what the zone,
+    /// the weather and the hour ask for so walking indoors does not switch it.
+    float fogExtinction_ = -1.0f;
+    void renderVolumetricFog();
+    void writeFogVolumeBindings();
+    float volumetricFogExtinction() const;
+
+    // Screen recording: the GPU side reads frames back, the recorder encodes.
+    std::unique_ptr<ScreenCapture> screenCapture_;
+    std::unique_ptr<core::ScreenRecorder> recorder_;
+    std::string recordingFailure_;
+    void collectRecordedFrame();
+    void recordScreenCapture();
+
+    // Screen-space sun shafts, built from the finished frame at the end of
+    // endFrame and added in the overlay pass ahead of the interface.
+    std::unique_ptr<SunShafts> sunShafts_;
+    bool sunShaftsEnabled_ = true;
+    /// renderWorld ran this frame. The shafts are built from the world's
+    /// picture, and a login screen or a loading screen is not one.
+    bool worldDrawnThisFrame_ = false;
+    void recordSunShafts();
 
     // GPU-driven grass: compute cull with atomic compaction feeding an
     // indirect draw, over a population generated from terrain suitability.

@@ -4,9 +4,11 @@
 #include "ui/imgui_theme.hpp"
 #include "ui/interface_fonts.hpp"
 
-#include <SDL2/SDL.h>
+#include <SDL3/SDL.h>
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <chrono>
 #include "core/window.hpp"
 #include "core/application.hpp"
@@ -15,7 +17,7 @@
 #include "game/game_handler.hpp"
 #include "rendering/vk_context.hpp"
 #include <imgui.h>
-#include <imgui_impl_sdl2.h>
+#include <imgui_impl_sdl3.h>
 #include <imgui_impl_vulkan.h>
 
 namespace wowee {
@@ -23,6 +25,10 @@ namespace ui {
 
 UIManager::UIManager() {
     // Create screen instances
+#ifdef WOWEE_HAVE_ASSET_PANEL
+    // Before any asset system exists, which is the state it is there for.
+    firstRunScreen = std::make_unique<FirstRunScreen>();
+#endif
     authScreen = std::make_unique<AuthScreen>();
     realmScreen = std::make_unique<RealmScreen>();
     characterCreateScreen = std::make_unique<CharacterCreateScreen>();
@@ -56,10 +62,13 @@ constexpr float kMinLogicalHeight = 620.0f;
 
 float interfaceScale([[maybe_unused]] SDL_Window* window) {
 #ifdef __ANDROID__
-    float diagonalDpi = 0.0f;
+    // SDL3 dropped SDL_GetDisplayDPI and answers with a content scale
+    // instead, which is the same number this was deriving: dpi over
+    // Android's 160 baseline is what the platform already calls 1x.
     float density = 2.0f;  // No answer from SDL; a phone is still not a monitor.
-    if (SDL_GetDisplayDPI(0, &diagonalDpi, nullptr, nullptr) == 0 && diagonalDpi > 0.0f) {
-        density = diagonalDpi / 160.0f;  // Android's own baseline for 1x.
+    if (const float scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
+        scale > 0.0f) {
+        density = scale;
     }
 
     // Density is what makes the text legible and the controls big enough to
@@ -111,7 +120,7 @@ bool UIManager::initialize(core::Window* win) {
     }
 
     // Initialize ImGui for SDL2 + Vulkan
-    ImGui_ImplSDL2_InitForVulkan(window->getSDLWindow());
+    ImGui_ImplSDL3_InitForVulkan(window->getSDLWindow());
 
     ImGui_ImplVulkan_InitInfo initInfo{};
     initInfo.ApiVersion = VK_API_VERSION_1_1;
@@ -276,6 +285,15 @@ void UIManager::loadInterfaceFont(const std::string& dataRoot,
     };
 
     const fs::path frizqt = resolve("frizqt__.ttf");
+    // Kept for any other ImGui context that wants the same face - a second
+    // window has an atlas of its own and would otherwise search for it again.
+    clientFontSize_ = kClientSize / (atlasScale > 0.0f ? atlasScale : 1.0f);
+    if (!frizqt.empty()) {
+        std::ifstream in(frizqt, std::ios::binary);
+        clientFontData_.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    } else if (assets) {
+        clientFontData_ = assets->readFileOptional("Fonts\\FRIZQT__.TTF");
+    }
     if (frizqt.empty() && addFromArchive("FRIZQT__.TTF", kClientSize)) {
         LOG_INFO("Interface font read from the archives rather than from disk");
     } else if (!frizqt.empty()) {
@@ -335,7 +353,7 @@ void UIManager::shutdown() {
         }
 
         ImGui_ImplVulkan_Shutdown();
-        ImGui_ImplSDL2_Shutdown();
+        ImGui_ImplSDL3_Shutdown();
         ImGui::DestroyContext();
         imguiInitialized = false;
     }
@@ -347,7 +365,7 @@ void UIManager::update([[maybe_unused]] float deltaTime) {
 
     // Start ImGui frame
     ImGui_ImplVulkan_NewFrame();
-    ImGui_ImplSDL2_NewFrame();
+    ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
 }
 
@@ -374,6 +392,14 @@ void UIManager::render(core::AppState appState, auth::AuthHandler* authHandler, 
 
     // Render appropriate screen based on application state
     switch (appState) {
+        case core::AppState::FIRST_RUN:
+#ifdef WOWEE_HAVE_ASSET_PANEL
+            // The same backdrop the other pre-game screens draw, so this does
+            // not look like a different program.
+            if (authScreen) authScreen->drawBackdrop();
+            if (firstRunScreen) firstRunScreen->render();
+#endif
+            break;
         case core::AppState::AUTHENTICATION:
             if (authHandler) {
                 authScreen->render(*authHandler);
@@ -440,30 +466,39 @@ void UIManager::finishImGuiFrame() {
     // so the panels have to go in after this stage has drawn the world's
     // overlays - and before the draw data is closed, which is here.
     if (!imguiInitialized) return;
-#ifdef __ANDROID__
-    // The SDL backend stopped calling these deliberately (imgui #6306), because
-    // on a desktop they only pertain to IME. On Android they are what raises
-    // and lowers the on-screen keyboard, so without them a text box takes
-    // focus, shows a caret, and there is no way to type into it.
+    // Text input for the pre-game screens' own fields.
+    //
+    // Those are PaperUI controls, not ImGui text boxes. They read characters
+    // from ImGui's queue and say they want them by setting WantTextInput, and
+    // the SDL backend never sees that: it starts text input only for an ImGui
+    // box of its own. SDL2 left text input on for the whole session, so it
+    // did not matter until SDL3, which leaves it off until asked - and then
+    // the login screen's fields took focus, showed a caret, and received
+    // nothing. On Android the same call is what raises the on-screen keyboard.
     //
     // Read after the frame is built, so it reflects the box the player just
-    // touched rather than the one they touched last frame.
-    if (const bool wantsText = ImGui::GetIO().WantTextInput; wantsText != softKeyboardUp_) {
+    // touched rather than the one they touched last frame. An interface edit
+    // box asks for itself in the main loop; see Application::run.
+    if (const bool wantsText = ImGui::GetIO().WantTextInput; wantsText != textInputUp_) {
+        // Both take the window in SDL3, text input being per-window there
+        // rather than global.
+        SDL_Window* sdlWindow = window ? window->getSDLWindow() : nullptr;
+        // Not restarted when an ImGui box already started it: a second start
+        // resets an IME composition in progress on some platforms.
         if (wantsText) {
-            SDL_StartTextInput();
+            if (!SDL_TextInputActive(sdlWindow)) SDL_StartTextInput(sdlWindow);
         } else {
-            SDL_StopTextInput();
+            SDL_StopTextInput(sdlWindow);
         }
-        softKeyboardUp_ = wantsText;
+        textInputUp_ = wantsText;
     }
-#endif
 
     ImGui::Render();
 }
 
 void UIManager::processEvent(const SDL_Event& event) {
     if (imguiInitialized) {
-        ImGui_ImplSDL2_ProcessEvent(&event);
+        ImGui_ImplSDL3_ProcessEvent(&event);
     }
 }
 

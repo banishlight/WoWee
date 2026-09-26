@@ -461,8 +461,18 @@ void EntitySpawner::processCreatureSpawnQueue(bool unlimited) {
                                 who.faceId = he.faceId;
                                 who.hairStyleId = he.hairStyleId;
                                 who.hairColorId = he.hairColorId;
-                                const auto sections =
-                                    pipeline::resolveCharacterSections(csDbc.get(), csF, who);
+                                // With the same existence check the spawn uses:
+                                // the underwear rows name art that was never
+                                // shipped - every Broken male torso among it -
+                                // and without the check this prefetched a file
+                                // the spawn never asks for, and warned that it
+                                // was missing.
+                                const auto sections = pipeline::resolveCharacterSections(
+                                    csDbc.get(), csF, who,
+                                    [](const std::string& path, void* ctx) {
+                                        return static_cast<pipeline::AssetManager*>(ctx)->fileExists(path);
+                                    },
+                                    am);
                                 for (const std::string* path : {&sections.bodySkin, &sections.skinExtra,
                                                                 &sections.faceLower, &sections.faceUpper,
                                                                 &sections.hair}) {
@@ -1377,7 +1387,7 @@ void EntitySpawner::processPendingTransportDoodads() {
             // 162=ShipStart, 163=ShipMoving, 164=ShipStop. Leaving them on the
             // first sequence freezes the icebreaker paddle (its sequence 0 is
             // static) and can leave the Bravery's sail rig in its furled pose.
-            m2Renderer->setInstanceAnimation(m2InstanceId, 163u, true);
+            m2Renderer->setInstanceAnimation(m2InstanceId, rendering::anim::SHIP_MOVING, true);
             std::string doodadPathLower = doodadTemplate.m2Path;
             std::transform(doodadPathLower.begin(), doodadPathLower.end(), doodadPathLower.begin(),
                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -1398,7 +1408,7 @@ void EntitySpawner::processPendingTransportDoodads() {
                 LOG_WARNING("Transport machinery spawned: ", doodadTemplate.m2Path,
                             " instance=", m2InstanceId,
                             " wmoInstance=", it->instanceId,
-                            " hasShipMoving=", m2Renderer->hasAnimation(m2InstanceId, 163u),
+                            " hasShipMoving=", m2Renderer->hasAnimation(m2InstanceId, rendering::anim::SHIP_MOVING),
                             " bounds=", haveBounds,
                             " worldPos=(", where.x, ",", where.y, ",", where.z, ")",
                             " radius=", radius);
@@ -1752,7 +1762,7 @@ void EntitySpawner::processPendingMount() {
     if (isTaxi) {
         // Try WotLK fly anims first, then Vanilla-friendly fallbacks
         using namespace rendering::anim;
-        uint32_t taxiCandidates[] = {FLY_FORWARD, FLY_IDLE, FLY_RUN_2, FLY_SPELL, FLY_RISE, SPELL_KNEEL_LOOP, FLY_CUSTOM_SPELL_10, DEAD, RUN};
+        uint32_t taxiCandidates[] = {FLY_FORWARD, FLY_IDLE, FLY_RUN, FLY_SPELL, FLY_RISE, SPELL_KNEEL_LOOP, FLY_CUSTOM_SPELL_10, DEAD, RUN};
         for (uint32_t anim : taxiCandidates) {
             if (charRenderer->hasAnimation(instanceId, anim)) {
                 startAnim = anim;

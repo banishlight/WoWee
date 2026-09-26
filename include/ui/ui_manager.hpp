@@ -1,13 +1,16 @@
 #pragma once
 
 #include "ui/auth_screen.hpp"
+#include "ui/first_run_screen.hpp"
 #include "ui/realm_screen.hpp"
 #include "ui/character_create_screen.hpp"
 #include "ui/character_screen.hpp"
 #include "ui/game_screen.hpp"
 #include "ui/ui_services.hpp"
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 // Forward declare SDL_Event
 union SDL_Event;
@@ -56,6 +59,11 @@ public:
                            pipeline::AssetManager* assets = nullptr);
     /// Whether a face has already been taken; a second call is a no-op.
     bool interfaceFontsLoaded_ = false;
+
+    /// The client's own face - FRIZQT - as bytes, and the size its panels use
+    /// at a scale of 1. Empty until loadInterfaceFont has found it.
+    [[nodiscard]] const std::vector<uint8_t>& clientFontData() const { return clientFontData_; }
+    [[nodiscard]] float clientFontSize() const { return clientFontSize_; }
 
     /**
      * Shutdown ImGui and cleanup
@@ -111,22 +119,23 @@ public:
     [[nodiscard]] const UIServices& getServices() const { return services_; }
 
 private:
-#ifdef __ANDROID__
-    /// Whether the on-screen keyboard is up, so it is raised and lowered once
-    /// per change rather than every frame. Declared only where it is read:
-    /// clang makes an unused private field an error, and the desktop builds
-    /// that use gcc did not say so.
-    bool softKeyboardUp_ = false;
-#endif
+    /// Whether this asked SDL for text input, so it is started and stopped
+    /// once per change rather than every frame.
+    bool textInputUp_ = false;
 
     /// How much bigger than a desktop layout this display needs the interface
     /// drawn. Decided once at start-up; the style and the font atlas both use
     /// it, and they have to agree. 1.0 off Android.
     float interfaceScale_ = 1.0f;
+    std::vector<uint8_t> clientFontData_;
+    float clientFontSize_ = 15.0f;
     core::Window* window = nullptr;
     UIServices services_;  // Injected services
 
     // UI Screens
+#ifdef WOWEE_HAVE_ASSET_PANEL
+    std::unique_ptr<FirstRunScreen> firstRunScreen;
+#endif
     std::unique_ptr<AuthScreen> authScreen;
     std::unique_ptr<RealmScreen> realmScreen;
     std::unique_ptr<CharacterCreateScreen> characterCreateScreen;

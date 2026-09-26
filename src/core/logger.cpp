@@ -10,9 +10,13 @@
 #include <iterator>
 #include <ranges>
 #include "core/local_time.hpp"
+#include "core/log_privacy.hpp"
 #include <cstdio>
 #ifdef __ANDROID__
 #include <android/log.h>
+#endif
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
 #endif
 
 namespace wowee {
@@ -52,6 +56,25 @@ std::filesystem::path perUserLogDir() {
     }
 #endif
     return std::filesystem::temp_directory_path() / "wowee-logs";
+}
+
+/// Whether this process is the executable inside a macOS application bundle.
+///
+/// main() moves the working directory into the bundle's Resources so the
+/// assets resolve, and an app dragged to /Applications is writable there. So
+/// the log went into the app itself - Contents/Resources/logs, where nobody
+/// finds it without Show Package Contents - and every run modified a signed
+/// bundle. A bundled client always logs to the per-user directory instead.
+bool runningFromAppBundle() {
+#if defined(__APPLE__)
+    uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::string path(size, '\0');
+    if (_NSGetExecutablePath(path.data(), &size) != 0) return false;
+    return path.find(".app/Contents/MacOS/") != std::string::npos;
+#else
+    return false;
+#endif
 }
 
 }  // namespace
@@ -95,7 +118,6 @@ void Logger::ensureFile() {
         else if (std::ranges::equal(v, "fatal"sv)) setLogLevel(LogLevel::FATAL);
     }
     std::error_code ec;
-    std::filesystem::create_directories("logs", ec);
     // WOWEE_LOG_FILE names the file, so a tool run beside the client does not
     // destroy the log the client wrote.
     //
@@ -106,18 +128,19 @@ void Logger::ensureFile() {
     // could be: by being asked to read a log and finding my own run in it.
     const char* logName = std::getenv("WOWEE_LOG_FILE");
     const std::string logFile = (logName && *logName) ? logName : "wowee.log";
-    const std::string logPath = std::string("logs/") + logFile;
-    fileStream.open(logPath, std::ios::out | std::ios::trunc);
+    if (!runningFromAppBundle()) {
+        std::filesystem::create_directories("logs", ec);
+        fileStream.open(std::string("logs/") + logFile, std::ios::out | std::ios::trunc);
+    }
 
     // Beside the working directory when that is writable, which is how this is
     // run from a checkout and where every tool expects to find it.
     //
-    // A bundled application has no such directory. macOS launches an .app with
-    // the working directory set to "/", so create_directories("logs") fails on
-    // a read-only root, the open fails with it, and the client runs with no log
-    // at all. That is not a quiet degradation: the log is the only thing a bug
-    // report has to go on, and the absence looks exactly like a client that
-    // wrote nothing worth saying.
+    // A bundled application has no such directory (see runningFromAppBundle),
+    // and anything run from somewhere read-only cannot make one: the open
+    // fails, and the client runs with no log at all. That is not a quiet
+    // degradation: the log is the only thing a bug report has to go on, and
+    // the absence looks exactly like a client that wrote nothing worth saying.
     if (!fileStream.is_open()) {
         const std::filesystem::path fallback = perUserLogDir();
         std::filesystem::create_directories(fallback, ec);
@@ -126,13 +149,19 @@ void Logger::ensureFile() {
         if (fileStream.is_open()) {
             // Said on the console, because the file it names is the one thing
             // someone reading this needs and it is not where they will look.
-            std::fprintf(stderr, "wowee: writing the log to %s\n", at.string().c_str());
+            std::fprintf(stderr, "wowee: writing the log to %s\n",
+                         redactHome(at.string(), homeDirectory()).c_str());
         }
     }
     lastFlushTime_ = std::chrono::steady_clock::now();
 }
 
-void Logger::emitLineLocked(LogLevel level, const std::string& message) {
+void Logger::emitLineLocked(LogLevel level, const std::string& rawMessage) {
+    // Every destination below gets the home directory as "~" - see
+    // log_privacy.hpp. Read once: it does not change while the client runs.
+    static const std::string home = homeDirectory();
+    const std::string message = redactHome(rawMessage, home);
+
     // Get current time
     auto now = std::chrono::system_clock::now();
     auto time = std::chrono::system_clock::to_time_t(now);

@@ -7,6 +7,44 @@
 #include <string>
 #include <cstring>
 
+#ifdef _WIN32
+// Guarded: CMakeLists passes both of these to every translation unit under
+// its Windows branch, and redefining one is a warning the build treats as an
+// error. Kept rather than dropped so the include below is still narrow if
+// this file is ever compiled outside that branch.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <shellapi.h>
+
+/// Open the asset manager window instead, when this was double-clicked.
+///
+/// Somebody who finds this in the install folder and runs it wants their
+/// assets built, not a usage message - and Explorer's console closes with the
+/// process, so they never see one anyway. The window beside it does the same
+/// job and asks for the folders rather than expecting them as flags.
+static bool startAssetManager() {
+    wchar_t self[MAX_PATH];
+    const DWORD length = GetModuleFileNameW(nullptr, self, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) return false;
+
+    const std::filesystem::path beside = std::filesystem::path(self).parent_path();
+    const std::filesystem::path gui = beside / L"wowee_assets.exe";
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(gui, ec)) return false;
+
+    // Over 32 is ShellExecute's success threshold; anything at or below it is
+    // one of its error codes.
+    const auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(
+        nullptr, L"open", gui.c_str(), nullptr, beside.c_str(), SW_SHOWNORMAL));
+    return result > 32;
+}
+#endif
+
 static void printUsage(const char* prog) {
     std::cout << "Usage: " << prog << " --mpq-dir <path> --output <path> [options]\n"
               << "\n"
@@ -54,6 +92,13 @@ static void printUsage(const char* prog) {
 }
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    // Nothing on the command line means Explorer, not a shell. Hand the
+    // person the window rather than a usage message their console closes
+    // before they can read. Falls through to that message when the window is
+    // not installed beside this.
+    if (argc == 1 && startAssetManager()) return 0;
+#endif
     wowee::tools::Extractor::Options opts;
     std::string expansion;
     std::string locale;
@@ -301,6 +346,19 @@ int main(int argc, char** argv) {
     if (opts.mpqDir.empty() || opts.outputDir.empty()) {
         std::cerr << "Error: --mpq-dir and --output are required\n\n";
         printUsage(argv[0]);
+#ifdef _WIN32
+        if (argc == 1) {
+            // Double-clicked, and the asset manager window was not beside
+            // this to hand over to. Explorer's console dies with the process,
+            // so without this pause the message above is gone before anyone
+            // can read it and the whole thing looks like it did nothing.
+            std::cout << "\nwowee_assets.exe, the window that does this "
+                         "without any of the above, was not found next to "
+                         "this program.\n"
+                      << "\nPress Enter to close this window...";
+            std::cin.get();
+        }
+#endif
         return 1;
     }
 
@@ -333,12 +391,14 @@ int main(int argc, char** argv) {
                      "Cataclysm server;\n      see docs/plan-cataclysm.md.\n";
     }
 
-    // Auto-detect locale if not specified
+    // Auto-detect locale if not specified. Nothing is said when none is found
+    // here: this looks in the folder that was named, which may be the game
+    // folder rather than Data, and the extractor asks again against the Data
+    // folder it resolves - so it is the one that knows whether a locale is
+    // really absent, and it warns there.
     if (locale.empty() || locale == "auto") {
         locale = wowee::tools::Extractor::detectLocale(opts.mpqDir);
-        if (locale.empty()) {
-            std::cerr << "Warning: No locale directory found, skipping locale-specific archives\n";
-        } else {
+        if (!locale.empty()) {
             std::cout << "Auto-detected locale: " << locale << "\n";
         }
     }

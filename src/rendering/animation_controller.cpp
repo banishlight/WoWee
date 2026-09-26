@@ -76,19 +76,6 @@ void AnimationController::playEmote(const std::string& emoteName) {
     uint32_t animId = result->animId;
     bool loop = result->loop;
 
-    // For looping emotes, prefer the EMOTE_STATE_* variant if the model has it
-    if (loop) {
-        uint32_t stateVariant = registry.getStateVariant(animId);
-        if (stateVariant != 0) {
-            auto* characterRenderer = renderer_->getCharacterRenderer();
-            uint32_t characterInstanceId = renderer_->getCharacterInstanceId();
-            if (characterRenderer && characterInstanceId > 0 &&
-                characterRenderer->hasAnimation(characterInstanceId, stateVariant)) {
-                animId = stateVariant;
-            }
-        }
-    }
-
     // What an emote resolved to, and whether the model can play it. An emote
     // that does nothing is either a name that resolved to no animation or an
     // animation the model does not carry, and from outside those look the same.
@@ -120,9 +107,12 @@ void AnimationController::playWeaponSheathAnimation(bool sheathing) {
     const uint32_t characterInstanceId = renderer_->getCharacterInstanceId();
     if (!characterRenderer || characterInstanceId == 0) return;
 
-    uint32_t animId = sheathing ? anim::SHEATHE : anim::UNSHEATHE;
+    // One animation both ways: 3.3.5 has Sheath and HipSheath and no unsheathe,
+    // and plays the reach for drawing as well as for putting away.
+    (void)sheathing;
+    uint32_t animId = anim::SHEATHE;
     if (!characterRenderer->hasAnimation(characterInstanceId, animId)) {
-        if (sheathing && characterRenderer->hasAnimation(characterInstanceId, anim::HIP_SHEATHE)) {
+        if (characterRenderer->hasAnimation(characterInstanceId, anim::HIP_SHEATHE)) {
             animId = anim::HIP_SHEATHE;
         } else {
             return;
@@ -404,8 +394,7 @@ void AnimationController::triggerRangedShot() {
             if (has(anim::ATTACK_RIFLE))    shootAnim = anim::ATTACK_RIFLE;
             break;
         case RangedWeaponType::CROSSBOW:
-            if (has(anim::ATTACK_CROSSBOW)) shootAnim = anim::ATTACK_CROSSBOW;
-            else if (has(anim::ATTACK_BOW)) shootAnim = anim::ATTACK_BOW;
+            if (has(anim::ATTACK_BOW)) shootAnim = anim::ATTACK_BOW;
             break;
         case RangedWeaponType::THROWN:
             if (has(anim::ATTACK_THROWN))    shootAnim = anim::ATTACK_THROWN;
@@ -763,17 +752,20 @@ void AnimationController::setMounted(uint32_t mountInstId, uint32_t mountDisplay
     mountAnims.jumpEnd   = discoveredEnd > 0 ? discoveredEnd : findFirst({anim::JUMP_END});
     mountAnims.rearUp    = findFirst({anim::MOUNT_SPECIAL, anim::RUN_RIGHT, anim::FALL});
     mountAnims.run       = findFirst({anim::RUN, anim::WALK});
-    mountAnims.runLeft   = findFirst({anim::MOUNT_RUN_LEFT, anim::RUN_LEFT});
-    mountAnims.runRight  = findFirst({anim::MOUNT_RUN_RIGHT, anim::RUN_RIGHT});
     mountAnims.stand     = findFirst({anim::STAND});
     // Discover flight animations (flying mounts only - may all be 0 for ground mounts)
-    mountAnims.flyIdle      = findFirst({anim::FLY_IDLE});
-    mountAnims.flyForward   = findFirst({anim::FLY_FORWARD, anim::FLY_RUN_2});
-    mountAnims.flyBackwards = findFirst({anim::FLY_BACKWARDS, anim::FLY_WALK_BACKWARDS});
-    mountAnims.flyLeft      = findFirst({anim::FLY_LEFT, anim::FLY_SHUFFLE_LEFT});
-    mountAnims.flyRight     = findFirst({anim::FLY_RIGHT, anim::FLY_SHUFFLE_RIGHT});
-    mountAnims.flyUp        = findFirst({anim::FLY_UP, anim::FLY_RISE});
-    mountAnims.flyDown      = findFirst({anim::FLY_DOWN});
+    //
+    // A 3.3.5 flying mount has Fly for moving and Hover for staying put - or
+    // Fly for that too, when it has no Hover (the wyvern) - and RunRight and
+    // RunLeft for strafing. Those two are the bank it leans into in the air:
+    // three or four seconds long, moving nothing, and carried by fliers alone -
+    // no ground mount has them - so they are strafing in flight, not on the
+    // ground. It has nothing for climbing, diving or backing up, so those stay
+    // empty and the FSM falls back.
+    mountAnims.flyForward   = findFirst({anim::FLY_FORWARD});
+    mountAnims.flyIdle      = findFirst({anim::FLY_IDLE, anim::FLY_FORWARD});
+    mountAnims.flyLeft      = findFirst({anim::RUN_LEFT});
+    mountAnims.flyRight     = findFirst({anim::RUN_RIGHT});
 
     // Discover idle fidget animations using proper WoW M2 metadata
     core::Logger::getInstance().debug("Scanning for fidget animations in ", sequences.size(), " sequences");
@@ -1049,7 +1041,8 @@ void AnimationController::updateMountedAnimation(float deltaTime) {
     mountIn.strafeRight = cameraController->isStrafingRight();
     mountIn.grounded = cameraController->isGrounded();
     mountIn.jumpKeyPressed = cameraController->isJumpKeyPressed();
-    mountIn.flying = cameraController->isFlyingActive();
+    // In the air, not allowed to be: on the ground a flying mount runs.
+    mountIn.flying = cameraController->isFlightAirborne();
     mountIn.swimming = cameraController->isSwimming();
     mountIn.ascending = cameraController->isAscending();
     mountIn.descending = cameraController->isDescending();
@@ -1070,22 +1063,9 @@ void AnimationController::updateMountedAnimation(float deltaTime) {
         characterRenderer->playAnimation(mountInstanceId_, mountOut.mountAnimId, mountOut.mountAnimLoop);
     }
 
-    // Rider animation - defaults to MOUNT, but uses MOUNT_FLIGHT_* variants when flying
-    uint32_t riderAnim = anim::MOUNT;
-    if (cameraController->isFlyingActive()) {
-        auto hasRider = [&](uint32_t id) { return characterRenderer->hasAnimation(characterInstanceId, id); };
-        if (mountIn.moving) {
-            if (cameraController->isAscending() && hasRider(anim::MOUNT_FLIGHT_UP))
-                riderAnim = anim::MOUNT_FLIGHT_UP;
-            else if (cameraController->isDescending() && hasRider(anim::MOUNT_FLIGHT_DOWN))
-                riderAnim = anim::MOUNT_FLIGHT_DOWN;
-            else if (hasRider(anim::MOUNT_FLIGHT_FORWARD))
-                riderAnim = anim::MOUNT_FLIGHT_FORWARD;
-        } else {
-            if (hasRider(anim::MOUNT_FLIGHT_IDLE))
-                riderAnim = anim::MOUNT_FLIGHT_IDLE;
-        }
-    }
+    // The rider sits in Mount, in the air as on the ground: 3.3.5 has no
+    // flight poses for a rider.
+    const uint32_t riderAnim = anim::MOUNT;
 
     // Apply rider animation
     uint32_t currentAnimId = 0;

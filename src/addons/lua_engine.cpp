@@ -18,7 +18,7 @@
 #include <set>
 #include <cstdlib>
 // The clipboard, for paste and copy in an edit box.
-#include <SDL.h>
+#include <SDL3/SDL.h>
 #include "addons/lua_api_helpers.hpp"
 #include "addons/lua_handler_globals.hpp"
 #include "addons/lua_api_registrations.hpp"
@@ -870,8 +870,18 @@ int lua_Region_GetWidth(lua_State* L) {
     const bool staleAutoSize =
         w && w->kind == wowee::ui::WidgetKind::FontString && w->autoSized &&
         !w->text.empty() && w->text != w->measuredText;
+    // Nor does one declared with no anchors and no size. The layout places it
+    // over its whole parent - that is where it draws, centred - but that rect
+    // is borrowed, not a width it was given, and FrameXML reads this to size
+    // the parent from the text: AudioOptionsVoicePanelDisabledMessage's
+    // OnLoad does self:SetWidth(Text:GetWidth()). Answering the one-unit
+    // parent it was sitting in kept that frame one unit wide, so its tooltip
+    // could only be found by hovering a single column of the words.
+    const bool widthBorrowed =
+        w && w->kind == wowee::ui::WidgetKind::FontString && w->anchors.empty() &&
+        w->width <= 0.0f;
     if (w && !w->text.empty() && w->kind == wowee::ui::WidgetKind::FontString &&
-        (staleAutoSize || (w->rectW <= 0.0f && w->width <= 0.0f))) {
+        (staleAutoSize || widthBorrowed || (w->rectW <= 0.0f && w->width <= 0.0f))) {
         // A font string that was never given a width is as wide as its text.
         // That is what WoW answers, and the interface sizes things from it:
         // PanelTemplates_TabResize builds a tab's width out of
@@ -1252,12 +1262,25 @@ static float scrollRange(wowee::ui::WidgetTree& tree, uint32_t id, bool vertical
     return over > 0.0f ? over : 0.0f;
 }
 
+/// A scroll offset from a script, with NaN read as no offset.
+///
+/// The clamp below cannot catch one: NaN is neither under zero nor over the
+/// range, so it was stored as it came. FrameXML hands one over honestly - the
+/// chat dock sizes its tabs from its scroll frame's width before it has
+/// anchored that frame, gets a tab size of zero, divides by it, and scrolls to
+/// zero times the result. The scroll child then sat at x = NaN, and so would
+/// every tab placed in it.
+float scrollOffsetArg(lua_State* L, int index) {
+    const double v = luaL_optnumber(L, index, 0.0);
+    return std::isnan(v) ? 0.0f : static_cast<float>(v);
+}
+
 int lua_ScrollFrame_SetVerticalScroll(lua_State* L) {
     auto* tree = wowee::addons::getWidgetTree(L);
     const uint32_t id = widgetIdOf(L, 1);
     if (!tree || id == 0) return 0;
     if (auto* w = tree->get(id)) {
-        const float v = static_cast<float>(luaL_optnumber(L, 2, 0.0));
+        const float v = scrollOffsetArg(L, 2);
         const float max = scrollRange(*tree, id, true);
         const float clamped = (v < 0.0f) ? 0.0f : (v > max ? max : v);
         const bool moved = (clamped != w->scrollY);
@@ -1275,7 +1298,7 @@ int lua_ScrollFrame_SetHorizontalScroll(lua_State* L) {
     const uint32_t id = widgetIdOf(L, 1);
     if (!tree || id == 0) return 0;
     if (auto* w = tree->get(id)) {
-        const float v = static_cast<float>(luaL_optnumber(L, 2, 0.0));
+        const float v = scrollOffsetArg(L, 2);
         const float max = scrollRange(*tree, id, false);
         const float clamped = (v < 0.0f) ? 0.0f : (v > max ? max : v);
         const bool moved = (clamped != w->scrollX);
@@ -1872,6 +1895,7 @@ static bool fillItemTooltipById(lua_State* L, game::GameHandler* gh,
                                 uint32_t itemId);
 static void appendRandomSuffix(wowee::ui::Widget* w, game::GameHandler* gh,
                                const game::ItemDef& item);
+static void appendDurabilityLine(wowee::ui::Widget* w, const game::ItemDef& item);
 
 /// One spell tooltip, for every path that shows one.
 ///
@@ -1976,7 +2000,13 @@ static bool fillSpellTooltip(wowee::ui::Widget* w, game::GameHandler* gh,
 
     const std::string body =
         gh->formatSpellDescription(spellId, gh->getSpellDescription(spellId));
-    if (!body.empty()) line(body, "", 1.0f, 1.0f, 1.0f);
+    if (!body.empty()) {
+        // Wrapped, as every line of prose in a tooltip is: a line that does
+        // not wrap sets the tooltip's width, and a description is a sentence
+        // or three - the tooltip grew as wide as the screen and ran off it.
+        line(body, "", 1.0f, 1.0f, 1.0f);
+        w->tooltipLines.back().wrap = true;
+    }
 
     w->shown = true;
     return true;
@@ -2307,6 +2337,7 @@ int lua_Tooltip_SetTalent(lua_State* L) {
         desc.left = body;
         desc.lc[0] = desc.lc[1] = desc.lc[2] = 1.0f; desc.lc[3] = 1.0f;
         desc.rc[0] = desc.rc[1] = desc.rc[2] = desc.rc[3] = 1.0f;
+        desc.wrap = true;  // prose; see fillSpellTooltip
         w->tooltipLines.push_back(std::move(desc));
     }
 
@@ -2353,6 +2384,7 @@ int lua_Tooltip_SetTradeSkillItem(lua_State* L) {
         desc.left = body;
         desc.lc[0] = desc.lc[1] = desc.lc[2] = 1.0f; desc.lc[3] = 1.0f;
         desc.rc[0] = desc.rc[1] = desc.rc[2] = desc.rc[3] = 1.0f;
+        desc.wrap = true;  // prose; see fillSpellTooltip
         w->tooltipLines.push_back(std::move(desc));
     }
     w->shown = true;
@@ -2628,7 +2660,10 @@ static void appendItemStats(wowee::ui::Widget* w, const game::ItemQueryResponseD
     }
 
     if (info.requiredLevel > 0) white("Requires Level " + std::to_string(info.requiredLevel));
-    if (!info.description.empty()) gold("\"" + info.description + "\"");
+    if (!info.description.empty()) {
+        gold("\"" + info.description + "\"");
+        w->tooltipLines.back().wrap = true;  // prose; see fillSpellTooltip
+    }
 }
 
 /// The same tooltip for an item known only by its id.
@@ -2834,6 +2869,29 @@ static void appendRandomSuffix(wowee::ui::Widget* w, game::GameHandler* gh,
     }
 }
 
+/// The "Durability X / Y" line the real client shows on a damageable item's
+/// tooltip. Both bag and paperdoll tooltips build from the item's template id
+/// - _WoweePopulateItemTooltip calls GetItemInfo, which knows nothing of any
+/// one instance - so this line, like the random suffix above, has to be
+/// appended from the instance separately. Colored the same way as the bag
+/// window's own durability line (item_tooltip.cpp), so the two agree.
+static void appendDurabilityLine(wowee::ui::Widget* w, const game::ItemDef& item) {
+    if (!w || item.maxDurability == 0) return;
+    const float pct = static_cast<float>(item.curDurability) /
+                       static_cast<float>(item.maxDurability);
+    wowee::ui::Widget::TooltipLine line;
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "Durability %u / %u",
+                  item.curDurability, item.maxDurability);
+    line.left = buf;
+    if (pct > 0.5f)       { line.lc[0] = 0.1f; line.lc[1] = 1.0f; line.lc[2] = 0.1f; }
+    else if (pct > 0.25f) { line.lc[0] = 1.0f; line.lc[1] = 1.0f; line.lc[2] = 0.0f; }
+    else                  { line.lc[0] = 1.0f; line.lc[1] = 0.2f; line.lc[2] = 0.2f; }
+    line.lc[3] = 1.0f;
+    line.rc[0] = line.rc[1] = line.rc[2] = line.rc[3] = 1.0f;
+    w->tooltipLines.push_back(std::move(line));
+}
+
 /// _WoweeAppendItemEnchants(self, bag, slot) - the enchants on a bag item.
 ///
 /// The bag tooltip is built in Lua and had no way to reach an item's GUID,
@@ -2931,6 +2989,11 @@ int lua_Tooltip_SetInventoryItem(lua_State* L) {
         // has named the suffix itself.
         appendRandomSuffix(w, gh, s.item);
     }
+    // Durability lives on the instance, same as the suffix above - the
+    // paperdoll's own icon tint already reads it correctly, but the tooltip
+    // never carried it, so hovering an equipped item said nothing a bag
+    // item's own ImGui tooltip already says.
+    appendDurabilityLine(w, s.item);
     // Equipment only: the guid list behind it is one per equipped slot, and a
     // bank slot's id would read off the end of it.
     if (slot <= static_cast<int>(game::EquipSlot::NUM_SLOTS)) {
@@ -5316,9 +5379,11 @@ static int lua_GetScreenHeight(lua_State* L) {
 static int lua_RecordMissingApi(lua_State* L) {
     const char* name = luaL_optstring(L, 1, "");
     if (name && *name) {
-        // Once per name, so a warning here is a bounded list rather than
-        // a stream, and it is the only trace of a gap as it happens.
-        LOG_WARNING("[Lua] missing API called: ", name);
+        // At debug level. Once per name, but that is still two hundred lines
+        // on every load, nearly all of them the optional frame parts the
+        // report at shutdown counts apart - and that report names every real
+        // gap, at warning, with the full list in missing_api.txt.
+        LOG_DEBUG("[Lua] missing API called: ", name);
         missingApiNames().insert(name);
     }
     return 0;
@@ -8034,7 +8099,7 @@ void LuaEngine::registerCoreAPI() {
         "                local label = triggerLabels[sp.trigger] or ''\n"
         "                local text = sp.description or sp.name or ''\n"
         "                if text ~= '' then\n"
-        "                    self:AddLine(label .. text, 0, 1, 0)\n"
+        "                    self:AddLine(label .. text, 0, 1, 0, 1)\n"
         "                end\n"
         "            end\n"
         "        end\n"
@@ -8051,7 +8116,7 @@ void LuaEngine::registerCoreAPI() {
         "            self:AddLine('Requires Level '..data.requiredLevel, 1, 1, 1)\n"
         "        end\n"
         "        -- Flavor text\n"
-        "        if data.description then self:AddLine('\"'..data.description..'\"', 1, 0.82, 0) end\n"
+        "        if data.description then self:AddLine('\"'..data.description..'\"', 1, 0.82, 0, 1) end\n"
         "        if data.startsQuest then self:AddLine('This Item Begins a Quest', 1, 0.82, 0) end\n"
         "    end\n"
         "    -- Sell price from GetItemInfo\n"
@@ -8187,7 +8252,10 @@ void LuaEngine::registerCoreAPI() {
         "        -- Description\n"
         "        local desc = GetSpellDescription(spellId)\n"
         "        if desc and desc ~= '' then\n"
-        "            self:AddLine(desc, 1, 0.82, 0)\n"
+        // Wrapped, as prose in a tooltip always is. Without the flag the
+        // description set the tooltip's width on its own and the tooltip ran
+        // off the edge of the screen.
+        "            self:AddLine(desc, 1, 0.82, 0, 1)\n"
         "        end\n"
         "        -- Cooldown\n"
         "        local start, dur = GetSpellCooldown(spellId)\n"
@@ -9436,12 +9504,13 @@ void LuaEngine::reportMissingApi() const {
     // them correctly absent, which is a report whose number means the opposite
     // of what it says. They are counted apart rather than dropped: a genuinely
     // missing sub-frame would hide here too, and the count is where it shows.
-    // Three names the interface asks for that the interface itself never
-    // provides, and that nothing here should.
+    // Names the interface reads while they are nil, by its own design, and
+    // that nothing here should provide.
     //
-    // Checked by grepping Data/interface for a definition of each: there is
-    // none, so they are nil in the real client too and Blizzard's own code is
-    // written around that.
+    // Checked by grepping Data/interface for each: the first two are never
+    // defined, and the last two are variables the interface sets itself, later
+    // than its first read. All four are nil in the real client at that read,
+    // and Blizzard's own code is written around it.
     //
     //   CaptureBar_Hide                 worldstateframe.lua does
     //                                   `onHide = CaptureBar_Hide`, which
@@ -9456,12 +9525,19 @@ void LuaEngine::reportMissingApi() const {
     //                                   and assigns it later; reading it before
     //                                   then is reading a variable that has not
     //                                   been set, which is what it is for.
+    //   LFRRaidList                     the raid browser's list, assigned by
+    //                                   LFRQueueFrame_Update the first time the
+    //                                   browser is filled. lfrframe.lua reads it
+    //                                   before that, guarded - `not LFRRaidList
+    //                                   or LFRRaidList[1]` - and a session that
+    //                                   never opens the browser never sets it.
     //
     // Counted apart rather than dropped, for the same reason the frame parts
     // are: the headline number is meant to be actionable, and three permanent
     // entries in it teach whoever reads it that the number is always three.
     static constexpr const char* kNeverDefinedByBlizzard[] = {
         "CaptureBar_Hide", "OptionsFrame_ToggleSubCategories", "ZonePVPType",
+        "LFRRaidList",
     };
     std::vector<std::string> partsOfFrames;
     std::vector<std::string> blizzardsOwn;
@@ -9499,7 +9575,7 @@ void LuaEngine::reportMissingApi() const {
                 partsOfFrames.size(), " were optional parts of frames that do "
                 "exist, and ", widgetFields.size(), " were fields read off a "
                 "widget before anything set them, and ", blizzardsOwn.size(),
-                " the interface asks for and never defines itself)");
+                " the interface reads while they are nil by its own design)");
     }
     std::string line;
     for (const auto& n : realGaps) {
@@ -9519,8 +9595,8 @@ void LuaEngine::reportMissingApi() const {
     const std::string path = core::getConfigRoot() + "/missing_api.txt";
     if (std::ofstream out(path); out) {
         for (const auto& n : realGaps) out << n << "\n";
-        out << "\n-- the interface asks for these and never defines them; "
-               "they are nil in the real client too --\n";
+        out << "\n-- the interface reads these while they are nil, by its own "
+               "design; they are nil in the real client too --\n";
         for (const auto& n : blizzardsOwn) out << n << "\n";
         out << "\n-- optional parts of frames that exist, correctly absent --\n";
         for (const auto& n : partsOfFrames) out << n << "\n";
@@ -10335,22 +10411,26 @@ bool LuaEngine::dispatchMouseWheel(float x, float y, float delta) {
     const float s = widgets_.uiScale();
     if (s > 0.0f) { x /= s; y /= s; }
 
-    // One notch, whatever the mouse said. WoW's OnMouseWheel delta is exactly
-    // 1 or -1 and FrameXML is written against that: hybridscrollframe.lua:46
-    // is `if ( delta == 1 ) then scroll up else scroll down end`, so a wheel
-    // that reported 2 or 3 - which any brisk scroll on a trackpad or a
-    // free-spinning wheel does - fell through to the else and scrolled *down*
-    // while the hand moved up.
+    // Whole notches of 1 or -1, each its own call. WoW's OnMouseWheel delta is
+    // exactly one or the other and FrameXML is written against that:
+    // hybridscrollframe.lua:46 is `if ( delta == 1 ) then scroll up else
+    // scroll down end`, so a wheel that reported 2 or 3 - which any brisk
+    // scroll on a trackpad or a free-spinning wheel does - fell through to the
+    // else and scrolled *down* while the hand moved up.
     //
-    // Down never showed it. Every negative delta fails that test too and lands
-    // in the same branch, which is the branch it wanted, so down worked at any
-    // speed and up worked only when the wheel happened to send a bare 1.
+    // How many notches is the wheel's travel scaled by the scroll speed
+    // setting, with what does not make a whole notch carried to the next
+    // event. It used to be one notch per event whatever the travel, which is
+    // right for a wheel - one event of 1.0 per click - and far too fast for a
+    // trackpad or a Magic Mouse, which send dozens of small deltas a swipe and
+    // turned each into a full line. A change of direction drops the carry, so
+    // reversing is immediate. The delta arrives in clicks of a wheel: macOS
+    // reports a trackpad in pixels, converted before this in wheelClicks.
     //
-    // Sign only, and not clamped elsewhere: the camera keeps the magnitude,
-    // because how far a zoom travels is a different question from which way a
-    // list moves.
-    delta = (delta > 0.0f) ? 1.0f : (delta < 0.0f ? -1.0f : 0.0f);
+    // The camera keeps the raw magnitude: how far a zoom travels is a
+    // different question from how many lines a list moves.
     if (delta == 0.0f) return false;
+    const float travel = delta * wheelSensitivity_;
 
     // Up from whatever is under the cursor to the first frame that asked for
     // the wheel. WoW works the same way: a scroll frame's child fills it and
@@ -10361,17 +10441,161 @@ bool LuaEngine::dispatchMouseWheel(float x, float y, float delta) {
     // started from whatever mouse-enabled child happened to be under the
     // cursor or, over the empty parts of a panel, from nothing at all. The
     // talent tree is all empty parts between its buttons.
+    //
+    // Taken even when this event made no whole notch: it is still the
+    // interface's travel, and the camera must not zoom on it.
     uint32_t wid = widgets_.hitTestWheel(x, y);
     while (wid != 0) {
         const auto* w = widgets_.get(wid);
         if (!w) break;
         if (w->wheelEnabled) {
-            callFrameScriptNumber(wid, "OnMouseWheel", delta);
+            // A frame whose scroll bar has been seen moving glides it, by
+            // fractions of a notch - see glideWheel.
+            if (glideWheel(wid, travel)) {
+                wheelCarry_ = 0.0f;
+                return true;
+            }
+            if ((travel > 0.0f) != (wheelCarry_ > 0.0f) && wheelCarry_ != 0.0f) wheelCarry_ = 0.0f;
+            wheelCarry_ += travel;
+            int notches = static_cast<int>(wheelCarry_);  // toward zero
+            wheelCarry_ -= static_cast<float>(notches);
+            // A flick of momentum scrolling can be worth dozens; a page at a
+            // time is plenty, and FrameXML runs a handler per notch.
+            constexpr int kMaxNotchesPerEvent = 10;
+            notches = std::clamp(notches, -kMaxNotchesPerEvent, kMaxNotchesPerEvent);
+            if (notches == 0) return true;
+
+            // Which scroll bar the notches move, if any: the frame's own
+            // sliders, read before and after. A scroll frame's bar is its
+            // child in every template that has one - UIPanelScrollFrame,
+            // FauxScrollFrame, HybridScrollFrame.
+            std::vector<std::pair<uint32_t, float>> sliders;
+            for (uint32_t child : w->children) {
+                const auto* c = widgets_.get(child);
+                if (c && c->objectType == "Slider") sliders.emplace_back(child, c->barValue);
+            }
+            // Heading somewhere already: step on from there, not from partway.
+            if (wheelGlide_.slider != 0) {
+                for (const auto& [slider, before] : sliders) {
+                    if (slider == wheelGlide_.slider) setSliderValue(slider, wheelGlide_.target);
+                }
+                wheelGlide_ = {};
+                for (auto& [slider, before] : sliders) before = widgets_.get(slider)->barValue;
+            }
+
+            const float step = notches > 0 ? 1.0f : -1.0f;
+            for (int i = 0; i < std::abs(notches); ++i) {
+                callFrameScriptNumber(wid, "OnMouseWheel", step);
+            }
+
+            // Exactly one moved, and landed inside its range - a stop at the
+            // end would understate a notch: that is the scroll bar, and one
+            // notch is what it moved by. Put it back and glide it there, and
+            // every later turn of the wheel over this frame glides.
+            uint32_t moved = 0;
+            float from = 0.0f;
+            int movedCount = 0;
+            for (const auto& [slider, before] : sliders) {
+                const auto* c = widgets_.get(slider);
+                if (c && c->barValue != before) { moved = slider; from = before; ++movedCount; }
+            }
+            if (movedCount == 1) {
+                const auto* c = widgets_.get(moved);
+                const float to = c->barValue;
+                if (to > c->barMin && to < c->barMax) {
+                    wheelBindings_[wid] = {moved, (to - from) / static_cast<float>(notches)};
+                }
+                setSliderValue(moved, from);
+                wheelGlide_ = {moved, to, from};
+            }
             return true;
         }
         wid = w->parent;
     }
+    // Nothing here to scroll: what was gathered belongs to no window.
+    wheelCarry_ = 0.0f;
     return false;
+}
+
+/// Scroll a frame the wheel has scrolled before by gliding its scroll bar.
+///
+/// A notch is all FrameXML knows how to scroll by - the handlers read only its
+/// sign - and a scroll frame moves half a page on one. A wheel therefore
+/// jumped half a page a click, and a trackpad, whose swipe is worth a fraction
+/// of a notch per event, could do no better than jump whenever enough of them
+/// added up to one.
+///
+/// Once a frame's notches have been seen moving its scroll bar, the bar is
+/// driven directly: the travel, in notches and fractions of one, sets where it
+/// is heading, and advanceWheelGlide eases it there a frame at a time. The
+/// bar's own OnValueChanged still does the scrolling, as it would for a drag
+/// of the thumb, so the list or text follows whatever the template does with
+/// it. Nothing is changed for a frame that has no bar - chat scrolls a line a
+/// notch and has none.
+bool LuaEngine::glideWheel(uint32_t wheelFrame, float notches) {
+    const auto it = wheelBindings_.find(wheelFrame);
+    if (it == wheelBindings_.end()) return false;
+    const WheelBinding binding = it->second;
+    const auto* bar = widgets_.get(binding.slider);
+    if (!bar || bar->parent != wheelFrame) {
+        wheelBindings_.erase(it);
+        return false;
+    }
+    const float from = wheelGlide_.slider == binding.slider ? wheelGlide_.target : bar->barValue;
+    const float lo = std::min(bar->barMin, bar->barMax);
+    const float hi = std::max(bar->barMin, bar->barMax);
+    const float target = std::clamp(from + notches * binding.perNotch, lo, hi);
+    if (wheelGlide_.slider != binding.slider) {
+        wheelGlide_ = {binding.slider, target, bar->barValue};
+    } else {
+        wheelGlide_.target = target;
+    }
+    return true;
+}
+
+void LuaEngine::advanceWheelGlide(float elapsed) {
+    if (wheelGlide_.slider == 0) return;
+    const auto* bar = widgets_.get(wheelGlide_.slider);
+    // Gone, taken hold of, or moved by something else - a drag of the thumb,
+    // the quest log jumping to a quest: that wins, and the glide stops.
+    if (!bar || holdsMousePress() || bar->barValue != wheelGlide_.lastSet) {
+        wheelGlide_ = {};
+        return;
+    }
+    // Most of the way in a tenth of a second, the rest trailing off: quick
+    // enough to keep up with the hand, slow enough to be seen moving.
+    constexpr float kRate = 22.0f;
+    const float remaining = wheelGlide_.target - bar->barValue;
+    float value = bar->barValue + remaining * (1.0f - std::exp(-kRate * elapsed));
+    if (std::abs(wheelGlide_.target - value) < 0.5f) value = wheelGlide_.target;
+    setSliderValue(wheelGlide_.slider, value);
+    const auto* after = widgets_.get(wheelGlide_.slider);
+    if (value == wheelGlide_.target || !after) {
+        wheelGlide_ = {};
+        return;
+    }
+    wheelGlide_.lastSet = after->barValue;
+}
+
+/// slider:SetValue(value), through the method so OnValueChanged fires exactly
+/// as it does for the interface's own calls.
+void LuaEngine::setSliderValue(uint32_t wid, float value) {
+    if (!L_) return;
+    lua_getglobal(L_, "__WoweeFramesByWid");
+    if (!lua_istable(L_, -1)) { lua_pop(L_, 1); return; }
+    lua_pushinteger(L_, static_cast<lua_Integer>(wid));
+    lua_rawget(L_, -2);
+    if (!lua_istable(L_, -1)) { lua_pop(L_, 2); return; }
+    lua_getfield(L_, -1, "SetValue");
+    if (!lua_isfunction(L_, -1)) { lua_pop(L_, 3); return; }
+    lua_pushvalue(L_, -2);
+    lua_pushnumber(L_, value);
+    if (lua_pcall(L_, 2, 0, 0) != 0) {
+        LOG_WARNING("Wheel glide: SetValue on ", scriptOrigin(widgets_, wid, "SetValue"),
+                    " failed: ", luaL_optstring(L_, -1, "?"));
+        lua_pop(L_, 1);
+    }
+    lua_pop(L_, 2);
 }
 
 bool LuaEngine::holdsMousePress() const {
@@ -10466,7 +10690,9 @@ void LuaEngine::dispatchMouse(float x, float y, float screenH, MouseButtons butt
         if (answer != lastAnswer && now - lastPress > 1.0) {
             lastPress = now;
             lastAnswer = answer;
-            LOG_WARNING("WidgetInput: press at (", x, ",", y, ") hit ", answer);
+            // Debug: one line per click in ordinary play. A click that lands
+            // and is refused still says so at warning, from the release below.
+            LOG_DEBUG("WidgetInput: press at (", x, ",", y, ") hit ", answer);
         }
     }
 
@@ -10884,7 +11110,7 @@ void LuaEngine::dispatchMouse(float x, float y, float screenH, MouseButtons butt
                                     target->name.empty() ? "(unnamed)"
                                                          : target->name.c_str(),
                                     dropOn == draggingWid_
-                                        ? " - the frame it was dragged from, so nothing was offered"
+                                        ? " - the frame it was dragged from; OnReceiveDrag ran"
                                         : " - OnReceiveDrag ran");
                     } else {
                         const auto* under = hit ? widgets_.get(hit) : nullptr;
@@ -10894,7 +11120,15 @@ void LuaEngine::dispatchMouse(float x, float y, float screenH, MouseButtons butt
                                     " - nothing at or above it takes a drop, so the "
                                     "cursor keeps what it is carrying");
                     }
-                    if (dropOn != 0 && dropOn != draggingWid_) {
+                    // Including the frame it came from. Dragging an action off
+                    // a button and letting go over the same button is how it
+                    // goes back: the pickup emptied the slot, and only the drop
+                    // puts it there again. Skipping that frame left the action
+                    // on the cursor, where the next Escape or click on the
+                    // world removed it for good - the "I knocked it off and
+                    // cannot put it back" report. A bag slot is the same: its
+                    // OnReceiveDrag puts the item back where it was.
+                    if (dropOn != 0) {
                         callFrameScript(dropOn, "OnReceiveDrag", b.name);
                     } else if (dropOn == 0 && L_) {
                         // Let go over the world, which is how an action is
@@ -11013,12 +11247,20 @@ void LuaEngine::dispatchMouse(float x, float y, float screenH, MouseButtons butt
                 // click that is handled are different things, and the gap
                 // between them is where a button that looks right does
                 // nothing. Says which of the three conditions refused it.
+                //
+                // A refusal at warning, a click that ran at debug: the second
+                // is every click in ordinary play, and it buried the first.
                 if (pressedWid_[i] != 0 && pressed && !pressed->name.empty()) {
-                    LOG_WARNING("WidgetInput: release on ", pressed->name,
-                                pressedWid_[i] != releasedOn ? " - cursor had moved off it"
-                                : !pressed->enabled  ? " - the frame is disabled"
-                                : !takesIt           ? " - it did not register for this button"
-                                                     : " - OnClick ran");
+                    const char* why =
+                        pressedWid_[i] != releasedOn ? " - cursor had moved off it"
+                        : !pressed->enabled          ? " - the frame is disabled"
+                        : !takesIt                   ? " - it did not register for this button"
+                                                     : nullptr;
+                    if (why) {
+                        LOG_WARNING("WidgetInput: release on ", pressed->name, why);
+                    } else {
+                        LOG_DEBUG("WidgetInput: release on ", pressed->name, " - OnClick ran");
+                    }
                 }
             }
             pressedWid_[i] = 0;
@@ -11198,6 +11440,7 @@ void LuaEngine::dispatchOnUpdate(float elapsed) {
     if (!L_) return;
 
     drainPendingTextChanged();
+    advanceWheelGlide(elapsed);
 
     // Animations first, so a frame's own OnUpdate sees this frame's values
     // rather than the previous one's.

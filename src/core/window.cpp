@@ -1,5 +1,4 @@
 #include "core/window.hpp"
-#include "platform/drawable_size.hpp"
 
 #include <algorithm>
 
@@ -9,7 +8,7 @@
 #include "core/config_paths.hpp"
 #include "stb_image.h"
 #include "rendering/vk_context.hpp"
-#include <SDL2/SDL_vulkan.h>
+#include <SDL3/SDL_vulkan.h>
 #include <cstdlib>
 #ifdef __APPLE__
 #include "core/macos_platform.hpp"
@@ -86,7 +85,9 @@ bool Window::initialize() {
 #endif
 
     // Initialize SDL
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
+    // SDL3 answers true on success where SDL2 answered 0: this test is
+    // inverted from what it was, not renamed.
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
         LOG_ERROR("Failed to initialize SDL: ", SDL_GetError());
         return false;
     }
@@ -138,14 +139,14 @@ bool Window::initialize() {
     // layer linked into the client (src/platform/webgpu).
     const bool vulkanLoaded = true;
 #else
-    bool vulkanLoaded = (SDL_Vulkan_LoadLibrary(nullptr) == 0);
+    bool vulkanLoaded = SDL_Vulkan_LoadLibrary(nullptr);
 #endif
 #ifdef _WIN32
     if (!vulkanLoaded) {
         const char* sysRoot = std::getenv("SystemRoot");
         if (sysRoot && *sysRoot) {
             std::string fallbackPath = std::string(sysRoot) + "\\System32\\vulkan-1.dll";
-            vulkanLoaded = (SDL_Vulkan_LoadLibrary(fallbackPath.c_str()) == 0);
+            vulkanLoaded = SDL_Vulkan_LoadLibrary(fallbackPath.c_str());
             if (vulkanLoaded) {
                 LOG_INFO("Loaded Vulkan library via explicit path: ", fallbackPath);
             }
@@ -166,10 +167,11 @@ bool Window::initialize() {
     }
 
     // Create Vulkan window (no GL attributes needed)
+    // SDL3 shows a window by default, so there is no SHOWN flag.
 #ifdef __EMSCRIPTEN__
-    Uint32 flags = SDL_WINDOW_SHOWN;
+    Uint32 flags = 0;
 #else
-    Uint32 flags = SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN;
+    Uint32 flags = SDL_WINDOW_VULKAN;
 #endif
 #ifdef __APPLE__
     // Draw at the display's own pixels rather than at its points.
@@ -183,26 +185,26 @@ bool Window::initialize() {
     // Apple only on purpose. It is the platform where a point is not a pixel
     // for this client; the swapchain now asks SDL for the drawable size
     // either way, so the two agree wherever they are already equal.
-    flags |= SDL_WINDOW_ALLOW_HIGHDPI;
+    flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;
 #endif
     if (config.fullscreen) {
-        flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+        flags |= SDL_WINDOW_FULLSCREEN;
     }
 #ifdef __ANDROID__
     // A phone has no windows to be one of. Fullscreen is also what makes SDL
     // put the activity in immersive mode, which is what hides the navigation
     // bar; without it the client draws into 2272x954 of a 2424x1080 panel and
     // the rest is system chrome.
-    flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+    flags |= SDL_WINDOW_FULLSCREEN;
 #endif
     if (config.resizable) {
         flags |= SDL_WINDOW_RESIZABLE;
     }
 
+    // SDL3 takes no position: a new window is placed by the platform, and
+    // SDL_SetWindowPosition is the way to say otherwise.
     window = SDL_CreateWindow(
         config.title.c_str(),
-        SDL_WINDOWPOS_CENTERED,
-        SDL_WINDOWPOS_CENTERED,
         width,
         height,
         flags
@@ -267,12 +269,14 @@ void Window::setWindowIcon() {
     // RGBA in memory order, which is what stb_image gives whatever the file
     // held. The masks say so explicitly rather than relying on the byte order
     // of the machine.
-    SDL_Surface* surface = SDL_CreateRGBSurfaceFrom(
-        pixels, w, h, 32, w * 4,
-        0x000000FFu, 0x0000FF00u, 0x00FF0000u, 0xFF000000u);
+    // SDL3 names the format instead of taking four masks. ABGR8888 is the
+    // one whose bytes are R,G,B,A in memory, which is what stb_image gives
+    // whatever the file held.
+    SDL_Surface* surface = SDL_CreateSurfaceFrom(
+        w, h, SDL_PIXELFORMAT_ABGR8888, pixels, w * 4);
     if (surface) {
         SDL_SetWindowIcon(window, surface);
-        SDL_FreeSurface(surface);
+        SDL_DestroySurface(surface);
     } else {
         LOG_DEBUG("Window icon surface failed: ", SDL_GetError());
     }
@@ -306,7 +310,9 @@ void Window::setFullscreen(bool enable) {
     if (enable) {
         windowedWidth = width;
         windowedHeight = height;
-        if (SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP) != 0) {
+        // SDL3 answers true on success where SDL2 answered 0, so this test
+        // is inverted from what it was rather than renamed.
+        if (!SDL_SetWindowFullscreen(window, true)) {
             LOG_WARNING("Failed to enter fullscreen: ", SDL_GetError());
             return;
         }
@@ -314,7 +320,7 @@ void Window::setFullscreen(bool enable) {
         SDL_GetWindowSize(window, &width, &height);
         refreshDrawableSize();
     } else {
-        if (SDL_SetWindowFullscreen(window, 0) != 0) {
+        if (!SDL_SetWindowFullscreen(window, false)) {
             LOG_WARNING("Failed to exit fullscreen: ", SDL_GetError());
             return;
         }
@@ -323,6 +329,10 @@ void Window::setFullscreen(bool enable) {
         width = windowedWidth;
         height = windowedHeight;
     }
+    // Said, as vsync changes are: several things can switch the window between
+    // full screen and not, and a report that it "did not stay" is otherwise a
+    // guess at which of them did.
+    LOG_WARNING("Window: full screen ", fullscreen ? "on" : "off", ", ", width, "x", height);
     if (vkContext) {
         vkContext->markSwapchainDirty();
     }
@@ -334,13 +344,17 @@ void Window::setVsync(bool enable) {
         vkContext->setVsync(enable);
         vkContext->markSwapchainDirty();
     }
-    LOG_INFO("VSync ", enable ? "enabled" : "disabled");
+    // WARNING, not INFO: this build logs INFO nowhere, so the one line that
+    // would say who turned vsync off never appeared. Vsync is set from four
+    // places and a stale one overriding a fresh one is invisible otherwise.
+    LOG_WARNING("VSync ", enable ? "enabled" : "disabled",
+                " (requested by the caller; swapchain marked dirty)");
 }
 
 void Window::refreshDrawableSize() {
     if (!window) { drawableWidth = width; drawableHeight = height; return; }
     int dw = 0, dh = 0;
-    platform::drawableSize(window, &dw, &dh);
+    SDL_GetWindowSizeInPixels(window, &dw, &dh);
     // A minimised window answers zero, and a swapchain of zero is a spec
     // violation - so the last good size stands until there is a real one.
     if (dw > 0 && dh > 0) {
@@ -353,7 +367,7 @@ void Window::applyResolution(int w, int h) {
     if (!window) return;
     if (w <= 0 || h <= 0) return;
     if (fullscreen) {
-        const int displayIndex = SDL_GetWindowDisplayIndex(window);
+        const int displayIndex = SDL_GetDisplayForWindow(window);
         if (displayIndex < 0) {
             LOG_WARNING("Could not determine display for fullscreen resolution ",
                         w, "x", h, ": ", SDL_GetError());
@@ -369,16 +383,18 @@ void Window::applyResolution(int w, int h) {
         // resolution is not the display's shape, stay on the desktop mode -
         // which is the shape the player just had - rather than honouring a
         // number at the cost of the picture.
-        SDL_DisplayMode desktop{};
-        if (SDL_GetDesktopDisplayMode(displayIndex, &desktop) == 0 &&
-            desktop.w > 0 && desktop.h > 0) {
+        // SDL3 hands back a pointer to the mode it owns rather than filling
+        // in a caller's copy and answering 0 for success.
+        const SDL_DisplayMode* desktopMode = SDL_GetDesktopDisplayMode(displayIndex);
+        if (desktopMode != nullptr && desktopMode->w > 0 && desktopMode->h > 0) {
+            const SDL_DisplayMode& desktop = *desktopMode;
             const float wantAspect = static_cast<float>(w) / static_cast<float>(h);
             const float haveAspect =
                 static_cast<float>(desktop.w) / static_cast<float>(desktop.h);
             if (std::abs(wantAspect - haveAspect) > haveAspect * 0.02f) {
                 LOG_INFO("Fullscreen keeps the desktop mode ", desktop.w, "x", desktop.h,
                          ": the chosen ", w, "x", h, " is a different shape");
-                if (SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP) == 0) {
+                if (SDL_SetWindowFullscreen(window, true)) {
                     SDL_GetWindowSize(window, &width, &height);
         refreshDrawableSize();
                     if (vkContext) vkContext->markSwapchainDirty();
@@ -387,23 +403,24 @@ void Window::applyResolution(int w, int h) {
             }
         }
 
-        SDL_DisplayMode requested{};
-        requested.w = w;
-        requested.h = h;
         SDL_DisplayMode closest{};
-        if (!SDL_GetClosestDisplayMode(displayIndex, &requested, &closest)) {
+        // The wanted size is arguments now, not a half-filled mode. 0 for the
+        // refresh rate means "whatever this display does", and false leaves
+        // out the high-density modes, which are the same picture at a scale
+        // this client does its own accounting for.
+        if (!SDL_GetClosestFullscreenDisplayMode(displayIndex, w, h, 0.0f, false, &closest)) {
             LOG_WARNING("No fullscreen display mode available near ", w, "x", h,
                         ": ", SDL_GetError());
             return;
         }
-        if (SDL_SetWindowDisplayMode(window, &closest) != 0) {
+        if (!SDL_SetWindowFullscreenMode(window, &closest)) {
             LOG_WARNING("Failed to select fullscreen display mode ", closest.w,
                         "x", closest.h, ": ", SDL_GetError());
             return;
         }
         // FULLSCREEN_DESKTOP always uses the desktop mode and was silently
         // ignoring the resolution selector (especially visible on macOS).
-        if (SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN) != 0) {
+        if (!SDL_SetWindowFullscreen(window, true)) {
             LOG_WARNING("Failed to apply fullscreen resolution ", closest.w,
                         "x", closest.h, ": ", SDL_GetError());
             return;
@@ -413,7 +430,10 @@ void Window::applyResolution(int w, int h) {
         if (vkContext) {
             vkContext->markSwapchainDirty();
         }
-        LOG_INFO("Fullscreen resolution applied: ", width, "x", height);
+        // At warning: this switches the display's mode, which on a desktop
+        // with more than one monitor is visible on all of them.
+        LOG_WARNING("Window: full screen display mode ", closest.w, "x", closest.h,
+                    " for a requested ", w, "x", h);
         return;
     }
     // Windowed. What is asked for and what is granted are not the same
@@ -432,9 +452,9 @@ void Window::applyResolution(int w, int h) {
     // one the window can actually be, and said out loud when it bites.
     int wantW = w;
     int wantH = h;
-    const int displayIndex = SDL_GetWindowDisplayIndex(window);
+    const int displayIndex = SDL_GetDisplayForWindow(window);
     SDL_Rect usable{};
-    if (displayIndex >= 0 && SDL_GetDisplayUsableBounds(displayIndex, &usable) == 0 &&
+    if (displayIndex >= 0 && SDL_GetDisplayUsableBounds(displayIndex, &usable) &&
         usable.w > 0 && usable.h > 0) {
         wantW = std::min(wantW, usable.w);
         wantH = std::min(wantH, usable.h);

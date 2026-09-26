@@ -465,6 +465,24 @@ bool MovementHandler::restoreWorldTransferFallbackIfNearOrigin(const char* conte
 // sendMovement
 // ============================================================
 
+void MovementHandler::setFlightAirborne(bool airborne) {
+    const uint32_t canFly = static_cast<uint32_t>(MovementFlags::CAN_FLY);
+    const uint32_t flying = static_cast<uint32_t>(MovementFlags::FLYING);
+    if (!(movementInfo.flags & canFly)) return;
+    const bool now = (movementInfo.flags & flying) != 0;
+    if (airborne == now) return;
+    if (airborne) {
+        movementInfo.flags |= flying;
+        return;
+    }
+    // Landed. Said with a heartbeat, which carries the flags and is never
+    // held back: the landing is otherwise only visible in the next movement
+    // packet, and a player who lands and stands still sends none.
+    movementInfo.flags &= ~(flying | static_cast<uint32_t>(MovementFlags::ASCENDING) |
+                            static_cast<uint32_t>(MovementFlags::DESCENDING));
+    sendMovement(Opcode::MSG_MOVE_HEARTBEAT);
+}
+
 void MovementHandler::sendMovement(Opcode opcode) {
     if (owner_.getState() != WorldState::IN_WORLD) {
         LOG_WARNING("Cannot send movement in state: ", (int)owner_.getState());
@@ -479,9 +497,25 @@ void MovementHandler::sendMovement(Opcode opcode) {
         (opcode == Opcode::MSG_MOVE_STOP_STRAFE) ||
         (opcode == Opcode::MSG_MOVE_STOP_TURN) ||
         (opcode == Opcode::MSG_MOVE_STOP_SWIM);
-    if (!serverMovementAllowed_ && !taxiAllowed) return;
-    if ((onTaxiFlight_ || taxiMountActive_) && !taxiAllowed) return;
-    if (owner_.resurrectPendingRef() && !taxiAllowed) return;
+    // Held back, and said: a packet not sent leaves the server with the last
+    // position it was told, while the player walks on here - so every NPC the
+    // player then walks up to is out of the server's reach, and refuses in
+    // silence. Once per stretch of it, not per packet.
+    const char* heldReason = nullptr;
+    if (!taxiAllowed) {
+        if (!serverMovementAllowed_) heldReason = "the server has not given control of the character";
+        else if (onTaxiFlight_) heldReason = "a taxi flight is in progress";
+        else if (taxiMountActive_) heldReason = "a taxi mount is on";
+        else if (owner_.resurrectPendingRef()) heldReason = "a resurrection is pending";
+    }
+    if (heldReason) {
+        if (heldReason != movementHeldReason_) {
+            movementHeldReason_ = heldReason;
+            LOG_WARNING("Movement: not sent while ", heldReason,
+                        " - the server keeps the last position it was told");
+        }
+        return;
+    }
 
     // Always send a strictly increasing non-zero client movement clock value.
     const uint32_t movementTime = nextMovementTimestampMs();
@@ -593,6 +627,12 @@ void MovementHandler::sendMovement(Opcode opcode) {
         case Opcode::MSG_MOVE_START_ASCEND:
             movementInfo.flags |= static_cast<uint32_t>(MovementFlags::ASCENDING);
             movementInfo.flags &= ~static_cast<uint32_t>(MovementFlags::DESCENDING);
+            // A climb with flight allowed is a take-off, and the client is
+            // the one that says so: FLYING goes out on this packet, not a
+            // frame later. See setFlightAirborne for the landing.
+            if (movementInfo.flags & static_cast<uint32_t>(MovementFlags::CAN_FLY)) {
+                movementInfo.flags |= static_cast<uint32_t>(MovementFlags::FLYING);
+            }
             break;
         case Opcode::MSG_MOVE_STOP_ASCEND:
             movementInfo.flags &= ~static_cast<uint32_t>(MovementFlags::ASCENDING);
@@ -810,6 +850,12 @@ void MovementHandler::sendMovement(Opcode opcode) {
         ? owner_.getPacketParsers()->buildMovementPacket(opcode, wireInfo, owner_.getPlayerGuid())
         : MovementPacket::build(opcode, wireInfo, owner_.getPlayerGuid());
     owner_.getSocket()->send(packet);
+    lastSentPos_ = glm::vec3(movementInfo.x, movementInfo.y, movementInfo.z);
+    hasSentMovement_ = true;
+    if (movementHeldReason_) {
+        LOG_WARNING("Movement: sending again (was held while ", movementHeldReason_, ")");
+        movementHeldReason_ = nullptr;
+    }
 
     if (opcode == Opcode::MSG_MOVE_HEARTBEAT) {
         lastHeartbeatSendTimeMs_ = movementInfo.time;
@@ -907,6 +953,18 @@ void MovementHandler::setPosition(float x, float y, float z) {
     movementInfo.x = x;
     movementInfo.y = y;
     movementInfo.z = z;
+    // The player's own entity goes with it. The server never echoes the
+    // player's movement back, so nothing else moved it: it stayed where the
+    // player logged in, landed or was teleported, and every distance measured
+    // from it - range on the action bar, IsSpellInRange, interact distance,
+    // tab targeting - was measured from there.
+    //
+    // Not during a client taxi flight, where the flight simulation moves the
+    // entity and the character is placed from it.
+    if (taxiClientActive_ || onTaxiFlight_) return;
+    if (auto player = owner_.getEntityManager().getEntity(owner_.getPlayerGuid())) {
+        player->setPosition(x, y, z, movementInfo.orientation);
+    }
 }
 
 void MovementHandler::setOrientation(float orientation) {

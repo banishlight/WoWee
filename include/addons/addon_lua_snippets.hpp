@@ -46,6 +46,7 @@ local kCategoryHost = {
     ["Graphics"]     = "video",
     ["Detail"]       = "video",
     ["Grass"]        = "video",
+    ["Ray Tracing"]  = "video",
     ["Upscaling"]    = "video",
     ["Display"]      = "video",
     ["Sound"]        = "audio",
@@ -70,6 +71,15 @@ end
 local function num(v)
     if v == math.floor(v) then return tostring(math.floor(v)) end
     return (string.format("%.2f", v):gsub("0+$", ""):gsub("%.$", ""))
+end
+
+-- Whether two setting values are the same one. Numbers by value, loosely: the
+-- schema's defaults arrive as single-precision floats, 0.4 as
+-- 0.40000000596046, while a setting reads back as the text "0.4".
+local function sameValue(a, b)
+    local x, y = tonumber(a), tonumber(b)
+    if x and y then return math.abs(x - y) <= 1e-5 * math.max(1, math.abs(y)) end
+    return tostring(a) == tostring(b)
 end
 
 -- Whether a control is worth offering yet, from the schema's own test against
@@ -210,8 +220,11 @@ local function newLayout(panel)
             bottom = -(height - 10)}
 end
 
-local function reserve(layout, height)
-    if layout.y - height < layout.bottom and layout.column < #layout.columns then
+-- `keepWith` is room that must fit after this in the same column - a heading's
+-- first control - or both go to the next one.
+local function reserve(layout, height, keepWith)
+    local needed = height + (keepWith or 0)
+    if layout.y - needed < layout.bottom and layout.column < #layout.columns then
         layout.column = layout.column + 1
         layout.y = COLUMN_TOP
     end
@@ -220,8 +233,12 @@ local function reserve(layout, height)
     return x, y
 end
 
-local function addHeading(layout, text)
-    local x, y = reserve(layout, 32)
+-- Kept with its first control. A heading that only just fitted at the foot of
+-- a column stayed there while the control under it went to the top of the
+-- next, so "Effects" sat alone at the bottom of the Detail page's first column
+-- with nothing beneath it and its three settings across the page.
+local function addHeading(layout, text, firstControlHeight)
+    local x, y = reserve(layout, 32, firstControlHeight)
     local label = layout.panel:CreateFontString(nil, "ARTWORK", "GameFontNormal")
     label:SetPoint("TOPLEFT", x, y - 4)
     label:SetText(text)
@@ -317,16 +334,23 @@ local function addSlider(layout, panel, setting)
     local function showValue(value)
         valueText:SetText(setting.label .. ":  " .. num(value))
     end
+    -- Only a drag writes. read() moves the thumb to the setting, and SetValue
+    -- fires this; writing from it put every slider on the page back each time
+    -- the window opened - applied again, saved again, and as the float the
+    -- thumb holds, so a fog strength of 0.4 went back as 0.40000000596046.
+    local reading = false
     slider:SetScript("OnValueChanged", function(self, value)
         showValue(value)
-        WoweeSetSetting(setting.key, tostring(value))
+        if not reading then WoweeSetSetting(setting.key, tostring(value)) end
     end)
     withTooltip(slider, setting.label,
                 joinReason(setting.tooltip, waitingOn(setting)))
     return {
         read = function()
             local value = tonumber(WoweeGetSetting(setting.key)) or setting.min
+            reading = true
             slider:SetValue(value)
+            reading = false
             showValue(value)
             setEnabled(slider, valueText, isEnabled(setting))
         end,
@@ -472,7 +496,7 @@ local function buildPanel(category, settings)
     for _, setting in ipairs(settings) do
         if setting.section ~= "" and setting.section ~= heading then
             heading = setting.section
-            addHeading(layout, heading)
+            addHeading(layout, heading, setting.kind == "bool" and 27 or 50)
         end
         local control
         if setting.kind == "bool" then
@@ -502,9 +526,16 @@ local function buildPanel(category, settings)
             opened[control.key] = WoweeGetSetting(control.key)
         end
     end
+    -- Both put back only what differs. Writing a setting applies it, and
+    -- Cancel with nothing changed wrote every row on every page: full screen
+    -- chose the display mode again, vertical sync rebuilt the swapchain,
+    -- anti-aliasing its pipelines.
     panel.cancel = function()
         for _, control in ipairs(controls) do
-            if opened[control.key] then control.write(opened[control.key]) end
+            local was = opened[control.key]
+            if was and not sameValue(WoweeGetSetting(control.key), was) then
+                control.write(was)
+            end
         end
         panel.refresh()
     end
@@ -514,7 +545,9 @@ local function buildPanel(category, settings)
     -- leaves every other panel's alone.
     panel.default = function()
         for _, setting in ipairs(settings) do
-            WoweeSetSetting(setting.key, tostring(setting.default))
+            if not sameValue(WoweeGetSetting(setting.key), setting.default) then
+                WoweeSetSetting(setting.key, tostring(setting.default))
+            end
         end
         panel.refresh()
     end
@@ -1387,12 +1420,43 @@ local function applyMoves()
     end
 end
 
+-- Stop the removed controls committing, without taking them off their panel.
+--
+-- Hiding a control does not retire it. VideoOptionsPanel_Okay and
+-- BlizzardOptionsPanel_OkayControl walk panel.controls and write each entry's
+-- cached value back to its cvar whether or not it changed, so pressing Okay on
+-- the video window replayed the vertical-sync checkbox's value from load time
+-- over the Display page's own row: turn vertical sync on, press Okay, and
+-- gxVSync came back as "0" and switched it off again. Windowed mode and gamma
+-- sat behind the same loop.
+--
+-- Clearing the cached value is what stops that. Both loops read newValue, then
+-- value, and do nothing when neither is set.
+--
+-- Taking the control out of panel.controls also stops it, and is wrong:
+-- BlizzardOptionsPanel_SetupControl runs only for controls in that list, and
+-- it is what assigns the uvar globals. SHOW_MULTI_ACTIONBAR_1 to _4 are four
+-- of them, so unregistering the action bar checkboxes left
+-- MultiActionBar_Update reading nil and the bottom bars gone. The list is
+-- where a control is set up; only the value is what commits it.
+local function silenceRemoved()
+    for f in pairs(removed) do
+        f.value = nil
+        f.newValue = nil
+        -- Defaults applies this one: the Windowed box's is windowed.
+        f.defaultValue = nil
+    end
+end
+
 local panels = {}
 local function applyRemoval()
     for f in pairs(removed) do
         local panel = f.GetParent and f:GetParent()
         if panel then panels[panel] = true end
     end
+    -- Repeated on every refresh, like the hiding: the panel's own OnEvent runs
+    -- SetupControl and puts a value back, and this hook runs after it.
+    silenceRemoved()
     for panel in pairs(panels) do
         if panel.GetChildren then
             for _, child in ipairs({ panel:GetChildren() }) do
@@ -1409,14 +1473,44 @@ end
 
 applyRemoval()
 
+-- And immediately before the panel acts. The hooks above run when a panel is
+-- shown or hears an event - but OptionsFrame_OnShow shows the first page and
+-- only then refreshes every page, and a checkbox's refresh stores its CVar as
+-- the value. So the Windowed box came away from opening the Video window
+-- holding gxWindow as it was then. Untick full screen on the Display page,
+-- press Okay, and the replay wrote that value back - full screen again.
+-- Silencing on the way into Okay, Cancel and Defaults holds whatever order the
+-- refreshes came in.
+for panel in pairs(panels) do
+    for _, key in ipairs({ "okay", "cancel", "default" }) do
+        local original = panel[key]
+        if type(original) == "function" then
+            panel[key] = function(...)
+                silenceRemoved()
+                return original(...)
+            end
+        end
+    end
+end
+
 -- A page with nothing left on it is the same puzzle as a disabled row, so it
 -- leaves the list. The entry is the panel itself, and the list skips anything
 -- marked hidden - which is what collapsed child categories already use.
+--
+-- Out of the list is not out of the frame: Okay, Cancel and Defaults still run
+-- every registered page, and each of these puts back the values its refresh
+-- read when the window opened. Mute on the Sound page, press Okay, and the
+-- game's own Sound page wrote Enable Sound back on. Whatever of theirs this
+-- client uses is a row on a page of ours, which does its own committing, so
+-- they are given nothing to do.
+local function nothing() end
 for _, name in ipairs(kRemovedCategories) do
     local panel = _G[name]
     if panel then
         panel.hidden = true
         if panel.Hide then panel:Hide() end
+        panel.okay, panel.cancel, panel.default, panel.refresh =
+            nothing, nothing, nothing, nothing
     end
 end
 for _, frameName in ipairs({ "AudioOptionsFrameCategoryFrame", "VideoOptionsFrameCategoryFrame" }) do
@@ -1771,6 +1865,56 @@ watcher:SetScript("OnEvent", function()
         end
     end
 end)
+)LUA";
+
+// The talent frame's preview: points picked with a click and held until Learn.
+//
+// Two things the game's own frame leaves to memory. A pick is drawn only as a
+// rank number, so which talents have points waiting is something to read off
+// every button - they are lit instead, the button's own highlight held on.
+// And the picks outlived the frame: closed and opened again, it still held a
+// half-made plan the player had walked away from. Closing it lets them go.
+//
+// Taking one point back is the frame's own right-click, which it already does.
+//
+// Installed when Blizzard_TalentUI loads, since the frame and the function
+// hooked here are that addon's, and it is loaded on demand.
+inline constexpr const char* kTalentPreviewLua = R"LUA(
+local function install()
+    if not PlayerTalentFrame or PlayerTalentFrame.__woweePreview then return end
+    PlayerTalentFrame.__woweePreview = true
+
+    PlayerTalentFrame:HookScript("OnHide", function(self)
+        if (GetGroupPreviewTalentPointsSpent(self.pet, self.talentGroup) or 0) > 0 then
+            ResetGroupPreviewTalentPoints(self.pet, self.talentGroup)
+        end
+    end)
+
+    hooksecurefunc("TalentFrame_Update", function(frame)
+        if frame ~= PlayerTalentFrame then return end
+        local preview = GetCVarBool("previewTalents")
+        local tab = PanelTemplates_GetSelectedTab(frame)
+        local prefix = frame:GetName() .. "Talent"
+        for i = 1, (MAX_NUM_TALENTS or 40) do
+            local button = _G[prefix .. i]
+            if not button then break end
+            local picked = false
+            if preview and tab and button:IsShown() then
+                local _, _, _, _, rank, _, _, _, previewRank =
+                    GetTalentInfo(tab, i, frame.inspect, frame.pet, frame.talentGroup)
+                picked = (previewRank or 0) > (rank or 0)
+            end
+            if picked then button:LockHighlight() else button:UnlockHighlight() end
+        end
+    end)
+end
+
+local watcher = CreateFrame("Frame")
+watcher:RegisterEvent("ADDON_LOADED")
+watcher:SetScript("OnEvent", function(_, _, addon)
+    if addon == "Blizzard_TalentUI" then install() end
+end)
+install()
 )LUA";
 
 inline constexpr const char* kChatInputBackgroundLua = R"LUA(

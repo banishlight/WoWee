@@ -47,7 +47,6 @@ jobs:
           cmake \
           build-essential \
           pkg-config \
-          libsdl2-dev \
           libglm-dev \
           libssl-dev \
           zlib1g-dev \
@@ -59,8 +58,33 @@ jobs:
           libswscale-dev \
           libavutil-dev \
           libunicorn-dev \
+          libxext-dev \
+          libxrandr-dev \
+          libxcursor-dev \
+          libxi-dev \
+          libxfixes-dev \
+          libxss-dev \
+          libxkbcommon-dev \
+          libwayland-dev \
+          wayland-protocols \
+          libdecor-0-dev \
           libx11-dev
         sudo apt-get install -y libstorm-dev || true
+
+    - name: Build SDL3 from source
+      run: |
+        # Ubuntu 24.04 has no libsdl3-dev: SDL3 landed in 25.04. Built here
+        # the way StormLib already is, rather than pinning the job to a newer
+        # runner image for one package.
+        set -euo pipefail
+        git clone --depth 1 --branch release-3.2.24 \
+          https://github.com/libsdl-org/SDL.git /tmp/SDL3
+        cmake -S /tmp/SDL3 -B /tmp/SDL3/build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TEST_LIBRARY=OFF
+        cmake --build /tmp/SDL3/build --parallel "$(nproc)"
+        sudo cmake --install /tmp/SDL3/build
+        sudo ldconfig
 
     - name: Configure
       run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DWOWEE_BUILD_TESTS=ON
@@ -136,7 +160,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        brew install cmake pkg-config sdl2 glm openssl@3 zlib ffmpeg unicorn \
+        brew install cmake pkg-config sdl3 glm openssl@3 zlib ffmpeg unicorn \
           stormlib vulkan-loader vulkan-headers molten-vk shaderc
 
     - name: Configure
@@ -247,10 +271,9 @@ jobs:
         cp -L "${MOLTENVK_PREFIX}/lib/libMoltenVK.dylib" \
           Wowee.app/Contents/Frameworks/libMoltenVK.dylib
 
-        # Homebrew's sdl2 formula is sdl2-compat, which loads SDL3 with dlopen
-        # instead of an LC_LOAD_DYLIB command. The recursive Mach-O walker
-        # cannot discover that runtime-only dependency, so bundle it explicitly
-        # at the @loader_path location sdl2-compat probes on macOS.
+        # Copied explicitly although the client now links SDL3 directly and
+        # the Mach-O walker below would find it: the walker rewrites what it
+        # finds, and having the dylib already in place keeps that one step.
         SDL3_PREFIX="$(brew --prefix sdl3)"
         cp -L "${SDL3_PREFIX}/lib/libSDL3.dylib" \
           Wowee.app/Contents/Frameworks/libSDL3.dylib
@@ -273,7 +296,6 @@ jobs:
         # copy only the referenced install names, and rewrite the whole graph.
         python3 tools/macos/bundle_dependencies.py \
           --app Wowee.app \
-          --search-dir "$(brew --prefix sdl2)/lib" \
           --search-dir "$(brew --prefix sdl3)/lib" \
           --search-dir "$(brew --prefix vulkan-loader)/lib" \
           --search-dir "$(brew --prefix openssl@3)/lib" \
@@ -453,7 +475,7 @@ jobs:
           mingw-w64-clang-aarch64-clang
           mingw-w64-clang-aarch64-ninja
           mingw-w64-clang-aarch64-pkgconf
-          mingw-w64-clang-aarch64-SDL2
+          mingw-w64-clang-aarch64-sdl3
           mingw-w64-clang-aarch64-glm
           mingw-w64-clang-aarch64-openssl
           mingw-w64-clang-aarch64-zlib
@@ -522,10 +544,20 @@ jobs:
     - name: Bundle DLLs
       shell: msys2 {0}
       run: |
-        ldd build/bin/wowee.exe \
-          | awk '/=> \// { print $3 }' \
-          | grep -iv '^/c/Windows' \
-          | xargs -I{} sh -c 'cp -n "{}" build/bin/ 2>/dev/null || true'
+        # Every program that ships, not the client alone. The asset tools are
+        # how anybody gets data to run the client with, and a configure that
+        # quietly disabled them - StormLib or SDL2 not found - produced a
+        # package with neither and said nothing. Their DLLs were assumed to be
+        # a subset of the client's rather than collected.
+        test -x build/bin/wowee.exe
+        test -x build/bin/asset_extract.exe
+        test -x build/bin/wowee_assets.exe
+        for exe in build/bin/wowee.exe build/bin/asset_extract.exe build/bin/wowee_assets.exe; do
+          ldd "$exe" \
+            | awk '/=> \// { print $3 }' \
+            | grep -iv '^/c/Windows' \
+            | xargs -I{} sh -c 'cp -n "{}" build/bin/ 2>/dev/null || true'
+        done
 
     - name: Package (ZIP)
       shell: msys2 {0}
@@ -569,7 +601,7 @@ jobs:
           mingw-w64-x86_64-gcc
           mingw-w64-x86_64-ninja
           mingw-w64-x86_64-pkgconf
-          mingw-w64-x86_64-SDL2
+          mingw-w64-x86_64-sdl3
           mingw-w64-x86_64-glm
           mingw-w64-x86_64-openssl
           mingw-w64-x86_64-zlib
@@ -635,10 +667,20 @@ jobs:
     - name: Bundle DLLs
       shell: msys2 {0}
       run: |
-        ldd build/bin/wowee.exe \
-          | awk '/=> \// { print $3 }' \
-          | grep -iv '^/c/Windows' \
-          | xargs -I{} sh -c 'cp -n "{}" build/bin/ 2>/dev/null || true'
+        # Every program that ships, not the client alone. The asset tools are
+        # how anybody gets data to run the client with, and a configure that
+        # quietly disabled them - StormLib or SDL2 not found - produced a
+        # package with neither and said nothing. Their DLLs were assumed to be
+        # a subset of the client's rather than collected.
+        test -x build/bin/wowee.exe
+        test -x build/bin/asset_extract.exe
+        test -x build/bin/wowee_assets.exe
+        for exe in build/bin/wowee.exe build/bin/asset_extract.exe build/bin/wowee_assets.exe; do
+          ldd "$exe" \
+            | awk '/=> \// { print $3 }' \
+            | grep -iv '^/c/Windows' \
+            | xargs -I{} sh -c 'cp -n "{}" build/bin/ 2>/dev/null || true'
+        done
 
     - name: Package (NSIS)
       shell: msys2 {0}
@@ -650,3 +692,52 @@ jobs:
         name: wowee-windows-x86-64-installer
         path: build/wowee-*.exe
         if-no-files-found: error
+
+  build-android:
+    name: Build (android arm64)
+    runs-on: ubuntu-24.04
+
+    # The Android sources are behind __ANDROID__ and nothing else compiles
+    # them, so until now only a release tag found out whether they still
+    # built. The SDL3 migration left two renamed event constants behind in
+    # application.cpp and the first sign of it was a broken release. Compiled
+    # here for the same reason the editor is: one job that says so beforehand.
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+      with:
+        submodules: true
+        # The APK takes its version from the nearest tag, which a shallow
+        # clone does not fetch. Without them the build falls back to 0.0.0.
+        fetch-depth: 0
+
+    - name: Set up JDK
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '17'
+
+    - name: Install the NDK the project pins
+      run: |
+        # android/app/build.gradle names this version; the runner ships another.
+        yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" \
+          --install "ndk;28.2.13676358" "platforms;android-34" "build-tools;34.0.0" >/dev/null
+
+    - name: Cache OpenSSL for Android
+      id: cache-openssl
+      uses: actions/cache@v4
+      with:
+        path: build-android-deps
+        key: android-openssl-${{ hashFiles('tools/build-android-deps.sh') }}
+
+    - name: Build OpenSSL for arm64
+      if: steps.cache-openssl.outputs.cache-hit != 'true'
+      run: |
+        export ANDROID_NDK_ROOT="${ANDROID_HOME}/ndk/28.2.13676358"
+        tools/build-android-deps.sh arm64-v8a
+
+    - name: Build the APK
+      working-directory: android
+      run: |
+        export ANDROID_NDK_ROOT="${ANDROID_HOME}/ndk/28.2.13676358"
+        ./gradlew :app:assembleRelease --no-daemon

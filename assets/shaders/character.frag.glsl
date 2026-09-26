@@ -16,7 +16,13 @@ layout(set = 0, binding = 0) uniform PerFrame {
     vec4 localLightPosRadius[64];
     vec4 localLightColorIntensity[64];
     ivec4 localLightMeta;
+    vec4 volumetricParams;  // x = on, y = near, z = 1 / ln(far / near), w = slices
+    mat4 rtViewProj;
+    vec4 rtCameraPos;
+    vec4 rtParams;
 };
+
+#include "rt_lighting.glsli"
 
 layout(set = 1, binding = 0) uniform sampler2D uTexture;
 
@@ -44,6 +50,7 @@ layout(set = 1, binding = 1) uniform CharMaterial {
 layout(set = 1, binding = 2) uniform sampler2D uNormalHeightMap;
 
 layout(set = 0, binding = 1) uniform sampler2DShadow uShadowMap;
+layout(set = 0, binding = 2) uniform sampler3D uFogVolume;
 
 layout(location = 0) in vec3 FragPos;
 layout(location = 1) in vec3 Normal;
@@ -209,6 +216,33 @@ vec2 parallaxOcclusionMap(vec2 uv, vec3 viewDirTS, float lodFactor) {
     return mix(uv, result, fadeFactor);
 }
 
+// The air between the camera and this point, out of the fog volume: rgb is
+// the light it scatters toward the camera, a how much of the point shows
+// through it. See VolumetricFog.
+vec4 fogVolumeAt(vec3 worldPos) {
+    vec4 clip = projection * view * vec4(worldPos, 1.0);
+    float depth = max(clip.w, 1e-4);
+    vec2 uv = clip.xy / depth * 0.5 + 0.5;
+    float slice = log(max(depth, volumetricParams.y) / volumetricParams.y) * volumetricParams.z;
+    // Each slice holds the air up to its far edge, so a point is read half a
+    // slice back from where it stands.
+    return textureLod(uFogVolume, vec3(uv, slice - 0.5 / volumetricParams.w), 0.0);
+}
+
+// The zone's distance fog, then the air in front of it. The distance fog is
+// the far haze the sky is painted to meet, so it goes on first; the volume is
+// everything between the camera and that, sunlit shafts and torch glow
+// included.
+vec3 applyFog(vec3 color, vec3 worldPos, float dist) {
+    float fogFactor = clamp((fogParams.y - dist) / (fogParams.y - fogParams.x), 0.0, 1.0);
+    color = mix(fogColor.rgb, color, fogFactor);
+    if (volumetricParams.x > 0.5) {
+        vec4 air = fogVolumeAt(worldPos);
+        color = color * air.a + air.rgb;
+    }
+    return color;
+}
+
 void main() {
     if (enablePOM == PREVIEW_SIMPLE_TEXTURE_MODE) {
         vec4 texColor = samplePreviewTexture(uTexture, TexCoord);
@@ -347,16 +381,17 @@ void main() {
             }
             shadow = mix(1.0, shadow, shadowParams.y);
         }
+        RtLight rt = rtLightAt(FragPos);
+        shadow = rtShadow(rt, shadow);
 
-        result = ambientColor.rgb * texColor.rgb
+        result = rtAmbient(rt, ambientColor.rgb) * texColor.rgb
                + shadow * (diff * lightColor.rgb * texColor.rgb + spec * lightColor.rgb);
     }
 
     if (unlit == 0) result += localLightContribution(FragPos, norm, texColor.rgb);
 
     float dist = length(viewPos.xyz - FragPos);
-    float fogFactor = clamp((fogParams.y - dist) / (fogParams.y - fogParams.x), 0.0, 1.0);
-    result = mix(fogColor.rgb, result, fogFactor);
+    result = applyFog(result, FragPos, dist);
     if (!finiteVec3(result)) {
         result = texColor.rgb;
     }

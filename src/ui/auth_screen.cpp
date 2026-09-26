@@ -9,6 +9,7 @@
 #include "pipeline/asset_inventory.hpp"
 #include "core/config_paths.hpp"
 #include "core/logger.hpp"
+#include "core/open_url.hpp"
 #include "core/version.hpp"
 #include "core/window.hpp"
 #include "rendering/renderer.hpp"
@@ -85,12 +86,57 @@ std::string AuthScreen::makeServerKey(const std::string& host, int port) {
     return ss.str();
 }
 
+std::string AuthScreen::serverRowLabel(const ServerProfile& s) {
+    std::string row = s.label.empty() ? makeServerKey(s.hostname, s.port) : s.label;
+    if (!s.username.empty()) row += "   " + s.username;
+    return row;
+}
+
 std::string AuthScreen::currentExpansionId() const {
     auto* reg = core::Application::getInstance().getExpansionRegistry();
     if (reg && reg->getActive()) {
         return reg->getActive()->id;
     }
     return "wotlk";
+}
+
+void AuthScreen::seedKnownServers() {
+    // The servers this client is developed and tested against, offered by
+    // name. A first run used to open on an empty list with the address
+    // defaulted to localhost - which is a server nobody new has - so the only
+    // way to reach anything was to already know a realmlist, and to find the
+    // box for it behind "more options". Nothing here is a recommendation; it
+    // is the address somebody would otherwise be looking up.
+    struct Known {
+        const char* label;
+        const char* hostname;
+        int port;
+        const char* expansionId;
+    };
+    static constexpr Known kKnown[] = {
+        {"ChromieCraft", "logon.chromiecraft.com", 3724, "wotlk"},
+    };
+
+    for (const Known& k : kKnown) {
+        const std::string key = makeServerKey(k.hostname, k.port);
+        bool already = false;
+        for (ServerProfile& s : servers_) {
+            if (makeServerKey(s.hostname, s.port) != key) continue;
+            // Somebody has logged into it before, so their own entry stands -
+            // it carries their account. It only gains the name.
+            if (s.label.empty()) s.label = k.label;
+            already = true;
+            break;
+        }
+        if (already) continue;
+
+        ServerProfile s;
+        s.hostname = k.hostname;
+        s.port = k.port;
+        s.expansionId = k.expansionId;
+        s.label = k.label;
+        servers_.push_back(std::move(s));
+    }
 }
 
 void AuthScreen::selectServerProfile(int index) {
@@ -249,8 +295,16 @@ void AuthScreen::render(auth::AuthHandler& authHandler) {
     // Load saved login info on first render
     if (!loginInfoLoaded) {
         loadLoginInfo();
+        // After the load, so it covers every way out of it - a config that
+        // was read, one that was migrated, and the first run where there is
+        // no file at all and the list would otherwise be empty.
+        seedKnownServers();
+        if (selectedServerIndex_ < 0 && !servers_.empty()) selectServerProfile(0);
         loginInfoLoaded = true;
         if (portText_.empty()) setPort(port);
+        // Only when the list left nothing to point at. This used to run
+        // unconditionally, so a first run opened aimed at a server the person
+        // running it does not have.
         if (hostname_.empty()) hostname_.setText("localhost");
         auto* registry = core::Application::getInstance().getExpansionRegistry();
         if (registry && registry->getActive()) {
@@ -393,6 +447,26 @@ void AuthScreen::render(auth::AuthHandler& authHandler) {
         ui_.text(ImVec2(at.x + 1.0f, at.y + 1.0f), core::kVersionString, size,
                  IM_COL32(0, 0, 0, 150));
         ui_.text(at, core::kVersionString, size, IM_COL32(0xEC, 0xE2, 0xCC, 0xC8));
+
+        // And beside it, if GitHub has a newer one. Next to the version
+        // rather than in the card: it is about the program, not about
+        // logging in, and the card is the busiest thing on the screen
+        // already. Nothing is downloaded - clicking it opens the release
+        // page and the player decides from there.
+        const core::UpdateCheck& updates = core::Application::getInstance().getUpdateCheck();
+        if (const std::string newer = updates.newerVersion(); !newer.empty()) {
+            const std::string note = "  -  " + newer + " is available";
+            const ImVec2 beside(at.x + ui_.textWidth(core::kVersionString, size), at.y);
+            ui_.text(ImVec2(beside.x + 1.0f, beside.y + 1.0f), note.c_str(), size,
+                     IM_COL32(0, 0, 0, 150));
+            if (ui_.link("update", beside, note.c_str(), size,
+                         IM_COL32(0xF6, 0xD9, 0x6B, 0xE0))) {
+                // openExternalUrl refuses anything that is not a plain
+                // http(s) URL, which is the standard every caller is held to
+                // - this one comes off the network like a chat link does.
+                core::openExternalUrl(updates.releaseUrl());
+            }
+        }
         ui_.setLayer(PaperLayer::Page);
     }
 
@@ -518,7 +592,6 @@ void AuthScreen::renderCard(auth::AuthHandler& authHandler, float screenW, float
     float advancedH = 0.0f;
     if (advancedOpen_) {
         advancedH = px(kRowGap) + px(2);                     // the rule above it
-        advancedH += fieldRow + px(kRowGap);                 // saved servers
         advancedH += fieldRow + px(kRowGap);                 // address and port
         if (haveExpansions) {
             advancedH += fieldRow + px(kRowGap);             // expansion
@@ -526,6 +599,9 @@ void AuthScreen::renderCard(auth::AuthHandler& authHandler, float screenW, float
             advancedH += smallRow + px(kRowGap);             // the one line instead
         }
         if (codeInAdvanced) advancedH += fieldRow + px(kRowGap);
+#ifdef WOWEE_HAVE_ASSET_PANEL
+        advancedH += smallRow + px(kRowGap);             // the assets link
+#endif
     }
 
     // The title, its rule and the gap under it, measured once and laid out from
@@ -536,6 +612,7 @@ void AuthScreen::renderCard(auth::AuthHandler& authHandler, float screenW, float
     const float titleBlockH = ui_.inkHeight(px(kTitleSize), true) * 1.02f + px(18);
 
     float contentH = titleBlockH;                            // title and its underline
+    contentH += fieldRow + px(kRowGap);                      // server
     contentH += fieldRow + px(kRowGap);                      // account
     contentH += fieldRow + px(kRowGap);                      // password
 
@@ -615,6 +692,43 @@ void AuthScreen::renderCard(auth::AuthHandler& authHandler, float screenW, float
     };
 
     bool submit = false;
+
+    // ---- which server ----------------------------------------------------
+    //
+    // First, and in the card rather than behind the disclosure: which server
+    // you are logging into is the question that comes before who you are, and
+    // somebody who has never done this cannot answer the two below it without
+    // it. It used to sit three rows down behind "more options", so the screen
+    // asked for an account on a server it never named.
+    {
+        std::vector<std::string> rows;
+        rows.reserve(servers_.size() + 1);
+        for (const ServerProfile& s : servers_) rows.push_back(serverRowLabel(s));
+        rows.emplace_back("Somewhere else...");
+
+        const bool known = selectedServerIndex_ >= 0 &&
+                           selectedServerIndex_ < static_cast<int>(servers_.size());
+        const std::string preview =
+            known ? serverRowLabel(servers_[static_cast<size_t>(selectedServerIndex_)])
+                  : makeServerKey(hostname_.text(), port);
+
+        int choice = known ? selectedServerIndex_ : static_cast<int>(servers_.size());
+        ui_.text(col.at(), "Server", labelSize, theme.inkSoft);
+        col.gap(labelRow);
+        const auto [a, b] = col.row(px(kFieldHeight));
+        if (ui_.dropdown("servers", a, b, preview, rows, &choice)) {
+            if (choice >= static_cast<int>(servers_.size())) {
+                // "Somewhere else" is a request for the address box, which
+                // lives behind the disclosure - so open it, or the choice
+                // does nothing visible and there is nowhere to type.
+                selectedServerIndex_ = -1;
+                advancedOpen_ = true;
+            } else {
+                selectServerProfile(choice);
+            }
+        }
+        col.gap(px(kRowGap));
+    }
 
     {
         PaperUI::FieldOpts opts;
@@ -756,32 +870,9 @@ void AuthScreen::renderCard(auth::AuthHandler& authHandler, float screenW, float
 
         auto& app = core::Application::getInstance();
 
-        // Saved servers.
-        {
-            ui_.text(col.at(), "Realm", labelSize, theme.inkSoft);
-            col.gap(labelRow);
-            std::vector<std::string> rows;
-            rows.reserve(servers_.size() + 1);
-            rows.emplace_back("Somewhere else...");
-            for (const auto& s : servers_) {
-                std::string row = makeServerKey(s.hostname, s.port);
-                if (!s.username.empty()) row += "   " + s.username;
-                rows.push_back(std::move(row));
-            }
-            std::string preview = (selectedServerIndex_ >= 0 &&
-                                   selectedServerIndex_ < static_cast<int>(servers_.size()))
-                ? makeServerKey(servers_[selectedServerIndex_].hostname,
-                                servers_[selectedServerIndex_].port)
-                : makeServerKey(hostname_.text(), port) + "   (not saved)";
-
-            int choice = selectedServerIndex_ + 1;  // row 0 is "somewhere else"
-            const auto [a, b] = col.row(px(kFieldHeight));
-            if (ui_.dropdown("servers", a, b, preview, rows, &choice)) {
-                if (choice == 0) selectedServerIndex_ = -1;
-                else selectServerProfile(choice - 1);
-            }
-            col.gap(px(kRowGap));
-        }
+        // The server list itself is in the card now, above the account it
+        // belongs with. What stays here is the address behind it, for the
+        // server that is not on the list.
 
         // Address and port, on one row, because they are one address.
         {
@@ -858,6 +949,27 @@ void AuthScreen::renderCard(auth::AuthHandler& authHandler, float screenW, float
             if (ui_.field("pin", a, b, pinCode_, opts).submitted) submit = true;
             col.gap(px(kRowGap));
         }
+
+#ifdef WOWEE_HAVE_ASSET_PANEL
+        // The way back to the asset builder once there is already something
+        // installed. It is the screen a first run opens on, and without a
+        // door to it from here the only way to add a second game - or to
+        // rebuild the one that is there - was to go and find the separate
+        // program that draws the same panel.
+        {
+            // A link rather than a button, and nothing explaining it. With
+            // this section open the card is already the tallest thing on the
+            // screen - a button's worth of height pushed the footer off the
+            // bottom edge - and the panel it opens says all of this at the
+            // top of itself. Same shape as the disclosure above it.
+            const char* label = "add or rebuild assets...";
+            const float w = ui_.textWidth(label, smallSize);
+            if (ui_.link("assets", ImVec2(centreX - w * 0.5f, col.y), label, smallSize)) {
+                core::Application::getInstance().setState(core::AppState::FIRST_RUN);
+            }
+            col.gap(smallRow + px(kRowGap));
+        }
+#endif
     }
 
     // ---- footer ----------------------------------------------------------

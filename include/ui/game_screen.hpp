@@ -23,11 +23,12 @@
 #include <unordered_set>
 
 #include "ui/scene_pick.hpp"
+#include <functional>
 
 namespace wowee {
 namespace core { class AppearanceComposer; class Window; }
 namespace pipeline { class AssetManager; }
-namespace rendering { class Renderer; }
+namespace rendering { class Renderer; namespace world_map { class WorldMapFacade; } }
 namespace ui {
 
 /**
@@ -142,8 +143,18 @@ public:
     /// GameHandler it never read.
     void takeScreenshot();
 
+    /// Screen recording, to ~/.wowee/recordings. Each says in the chat what
+    /// it did, and where the file is.
+    void startRecording();
+    void stopRecording();
+    void toggleRecording();
+
 private:
     void applyCameraControlSettings();
+    /// Say in the chat why a recording stopped by itself, if one did.
+    void reportRecordingFailure();
+    /// Where the recording in progress, or the last one, is being written.
+    std::string recordingPath_;
 
     // Injected UI services (Section 3.5 Phase B - replaces getInstance() calls)
     UIServices services_;
@@ -332,6 +343,14 @@ private:
      * Inventory screen
      */
     void renderWorldMap(game::GameHandler& gameHandler);
+    /// Everything a map shows besides the land, for either map: the in-game
+    /// one and the one on the second window. See game_screen_hud.cpp.
+    /// `questAreaShown` says which quests have their objective areas shaded:
+    /// the one chosen in the game's quest log for its map, the one chosen in
+    /// the map window's own list for that one.
+    void feedWorldMap(game::GameHandler& gameHandler,
+                      rendering::world_map::WorldMapFacade& targetMap,
+                      const std::function<bool(uint32_t)>& questAreaShown);
 
     InventoryScreen inventoryScreen;
     uint64_t inventoryScreenCharGuid_ = 0;  // GUID of character inventory screen was initialized for

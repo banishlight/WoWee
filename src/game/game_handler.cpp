@@ -1,4 +1,5 @@
 #include "game/game_handler.hpp"
+#include "game/reputation_standing.hpp"
 
 #include <set>
 
@@ -582,6 +583,12 @@ void GameHandler::updateTimers(float deltaTime) {
         if (resyncQuestLogFromServerSlots(true)) {
             pendingLoginQuestResync_ = false;
             pendingLoginQuestResyncTimeout_ = 0.0f;
+            // trackedQuestIds_ was restored from the character config earlier
+            // at login, before addons were guaranteed loaded, so that restore
+            // may never have reached WatchFrame. This is the first point after
+            // world entry where both the quest log and the tracked-quest set
+            // are known settled, so force the one redraw the tracker needs.
+            fireAddonEvent("QUEST_LOG_UPDATE", {});
         } else if (pendingLoginQuestResyncTimeout_ <= 0.0f) {
             pendingLoginQuestResync_ = false;
             pendingLoginQuestResyncTimeout_ = 0.0f;
@@ -886,11 +893,44 @@ void GameHandler::update(float deltaTime) {
             if (!npc) return;
             float dx = movementInfo.x - npc->getX();
             float dy = movementInfo.y - npc->getY();
-            if (std::sqrt(dx * dx + dy * dy) > game::NPC_INTERACT_MAX_DISTANCE) {
+            const float distance = std::sqrt(dx * dx + dy * dy);
+            if (distance > game::NPC_INTERACT_MAX_DISTANCE) {
                 closeFn();
-                LOG_INFO(label, " closed: walked too far from NPC");
+                // Warning: a window closing by itself is a report waiting to
+                // happen, and the client is the one deciding.
+                LOG_WARNING(label, " closed: ", distance, " yards from the NPC, past ",
+                            game::NPC_INTERACT_MAX_DISTANCE);
             }
         };
+        // A hello the server never answered. It says nothing when it refuses,
+        // so this is the only place the refusal can be seen.
+        if (pendingNpcHello_.guid != 0 &&
+            std::chrono::steady_clock::now() - pendingNpcHello_.sentAt > std::chrono::milliseconds(1500)) {
+            const int reaction = pendingNpcHello_.reaction;
+            // Where the server has the player: the last movement packet sent.
+            // Far from the NPC while the client stands beside it means the
+            // server never heard the walk over.
+            float sentDistance = -1.0f;
+            glm::vec3 sent;
+            auto npc = entityController_->getEntityManager().getEntity(pendingNpcHello_.guid);
+            if (npc && movementHandler_ && movementHandler_->lastSentPosition(sent)) {
+                sentDistance = glm::length(sent - glm::vec3(npc->getX(), npc->getY(), npc->getZ()));
+            }
+            LOG_WARNING("Talk: ", pendingNpcHello_.name.empty() ? "an NPC" : pendingNpcHello_.name,
+                        " (guid 0x", std::hex, pendingNpcHello_.guid, std::dec, ")",
+                        " did not answer. Asked from ", pendingNpcHello_.distance,
+                        " yards here and ", sentDistance,
+                        " from the last position sent to the server (3D); npc flags 0x",
+                        std::hex, pendingNpcHello_.npcFlags, std::dec,
+                        "; movement allowed=", movementHandler_ && movementHandler_->isServerMovementAllowed(),
+                        " taxi=", movementHandler_ && movementHandler_->isOnTaxiFlight(),
+                        " taxi mount=", movementHandler_ && movementHandler_->isTaxiMountActive(),
+                        "; it regards you as ",
+                        reaction >= 1 && reaction <= 8 ? kReputationStandings[reaction - 1].name : "?",
+                        ". The server refuses in silence when the NPC is out of reach, busy, "
+                        "or regards you as Unfriendly or worse");
+            pendingNpcHello_.guid = 0;
+        }
         closeIfTooFar(isVendorWindowOpen(), getVendorItems().vendorGuid, [this]{ closeVendor(); }, "Vendor");
         closeIfTooFar(isGossipWindowOpen(), getCurrentGossip().npcGuid, [this]{ closeGossip(); }, "Gossip");
         // The movement handler's guid, not a copy of it: the one this class
@@ -2777,6 +2817,13 @@ void GameHandler::loadFactionNameCache() const {
                 factionParent_[factionId] = parentId;
             }
         }
+        // The starting standing by race and class, fields 2 to 13 in every
+        // expansion's Faction.dbc.
+        if (dbc->getFieldCount() > 13) {
+            std::array<int32_t, 12> base{};
+            for (uint32_t f = 0; f < 12; ++f) base[f] = dbc->getInt32(i, 2 + f);
+            factionRepBase_[factionId] = base;
+        }
         // Build repListId ↔ factionId mapping (WotLK field 1)
         if (hasRepListField) {
             uint32_t repListId = dbc->getUInt32(i, REPLIST_FIELD);
@@ -2788,6 +2835,50 @@ void GameHandler::loadFactionNameCache() const {
     }
     LOG_INFO("Faction.dbc: loaded ", factionNameCache_.size(), " faction names, ",
              factionRepListToId_.size(), " with reputation tracking");
+}
+
+int GameHandler::unitReactionToPlayer(const Unit& unit) const {
+    const uint32_t ft = unit.getFactionTemplate();
+    if (auto it = factionTemplateRepList_.find(ft);
+        it != factionTemplateRepList_.end() && it->second < initialFactions_.size()) {
+        const auto& standing = initialFactions_[it->second];
+        int rank = reputationStandingFor(standing.standing).id;
+        if (standing.flags & FACTION_FLAG_AT_WAR) rank = std::min(rank, 4);
+        return rank;
+    }
+    if (unit.isHostile()) return 2;
+    return isFriendlyFaction(ft) ? 5 : 4;
+}
+
+void GameHandler::refreshUnitHostility() {
+    if (factionTemplateRepList_.empty()) return;
+    for (const auto& [guid, entity] : getEntityManager().getEntities()) {
+        if (!entity || !entity->isUnit()) continue;
+        auto* unit = static_cast<Unit*>(entity.get());
+        unit->setHostile(isHostileFaction(unit->getFactionTemplate()));
+    }
+}
+
+int32_t GameHandler::factionBaseReputation(uint32_t factionId) const {
+    loadFactionNameCache();
+    auto it = factionRepBase_.find(factionId);
+    if (it == factionRepBase_.end()) return 0;
+    const uint8_t race = getPlayerRace();
+    const uint8_t cls = getPlayerClass();
+    const uint32_t raceMask = race ? (1u << (race - 1)) : 0;
+    const uint32_t classMask = cls ? (1u << (cls - 1)) : 0;
+    const auto& f = it->second;
+    // The server's own rule, slot by slot: a slot for this race, or a
+    // class-only slot, whose class mask is this class or empty.
+    for (int slot = 0; slot < 4; ++slot) {
+        const uint32_t slotRaces = static_cast<uint32_t>(f[slot]);
+        const uint32_t slotClasses = static_cast<uint32_t>(f[4 + slot]);
+        if (((slotRaces & raceMask) != 0 || (slotRaces == 0 && slotClasses != 0)) &&
+            ((slotClasses & classMask) != 0 || slotClasses == 0)) {
+            return f[8 + slot];
+        }
+    }
+    return 0;
 }
 
 uint32_t GameHandler::getFactionIdByRepListId(uint32_t repListId) const {
@@ -2978,10 +3069,12 @@ void GameHandler::runInterfaceCommand(const std::string& lua) const {
         LOG_WARNING("interface command dropped, no interface yet: ", lua);
         return;
     }
-    // At warning level, because the file log filters info out by default and
-    // this is the line that separates "the key never arrived" from "the key
-    // arrived and the interface did nothing with it".
-    LOG_WARNING("interface command: ", lua);
+    // At debug level: it is every key and every panel the client opens, and
+    // some commands are a dozen lines of Lua. The two lines that matter at
+    // warning are the ones either side - dropped for want of an interface, and
+    // failed when it ran. WOWEE_LOG_LEVEL=debug separates "the key never
+    // arrived" from "it arrived and the interface did nothing with it".
+    LOG_DEBUG("interface command: ", lua);
     interfaceCommand_(lua);
 }
 

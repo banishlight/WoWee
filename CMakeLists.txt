@@ -288,33 +288,22 @@ endif()
 
 # Find required packages
 #
-# Android has no system SDL2, so it is fetched and built with the client. SDL's
-# own CMake provides the same SDL2::SDL2 target find_package would, so nothing
+# Android has no system SDL, so it is fetched and built with the client. SDL's
+# own CMake provides the same SDL3::SDL3 target find_package would, so nothing
 # downstream changes.
 #
-# Pinned to the last SDL2 release rather than to what the desktop packages
-# carry: 2.30 calls ALooper_pollAll, which NDK 28 marks unavailable, so it does
-# not compile against a current NDK at all.
+# SDL3 installs its headers as <SDL3/SDL.h>, which is the spelling the sources
+# use, so unlike the SDL2 build there is no include shim to arrange here.
 if(ANDROID)
     include(FetchContent)
-    set(SDL_SHARED ON  CACHE BOOL "" FORCE)   # SDLActivity loads libSDL2.so
+    set(SDL_SHARED ON  CACHE BOOL "" FORCE)   # SDLActivity loads libSDL3.so
     set(SDL_STATIC OFF CACHE BOOL "" FORCE)
     set(SDL_TEST   OFF CACHE BOOL "" FORCE)
-    FetchContent_Declare(SDL2
+    FetchContent_Declare(SDL3
         GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-        GIT_TAG        release-2.32.10
+        GIT_TAG        release-3.2.24
         GIT_SHALLOW    TRUE)
-    FetchContent_MakeAvailable(SDL2)
-
-    # This client includes <SDL2/SDL.h>, the layout the Linux and macOS packages
-    # install. SDL's own build tree puts the headers at the top of include/, so
-    # a directory holding one link named SDL2 makes the same spelling work
-    # without touching the 30-odd files that use it.
-    set(WOWEE_SDL2_COMPAT_INC ${CMAKE_BINARY_DIR}/sdl2-compat-include)
-    file(MAKE_DIRECTORY ${WOWEE_SDL2_COMPAT_INC})
-    file(CREATE_LINK ${sdl2_SOURCE_DIR}/include ${WOWEE_SDL2_COMPAT_INC}/SDL2
-         SYMBOLIC COPY_ON_ERROR)
-    include_directories(${WOWEE_SDL2_COMPAT_INC})
+    FetchContent_MakeAvailable(SDL3)
 
     # Header-only, and there is no system copy to find on Android.
     FetchContent_Declare(glm
@@ -338,15 +327,15 @@ if(ANDROID)
 elseif(EMSCRIPTEN)
     include(FetchContent)
 
-    # SDL2 and zlib are Emscripten ports: the flag both puts the headers on the
+    # SDL3 and zlib are Emscripten ports: the flag both puts the headers on the
     # include path and links the library, building it into the Emscripten
-    # cache on first use. The port installs as <SDL2/SDL.h>, the layout this
+    # cache on first use. The port installs as <SDL3/SDL.h>, the layout this
     # client already includes.
-    add_library(SDL2::SDL2 INTERFACE IMPORTED)
-    set_target_properties(SDL2::SDL2 PROPERTIES
-        INTERFACE_COMPILE_OPTIONS "-sUSE_SDL=2"
-        INTERFACE_LINK_OPTIONS    "-sUSE_SDL=2")
-    set(SDL2_FOUND TRUE)
+    add_library(SDL3::SDL3 INTERFACE IMPORTED)
+    set_target_properties(SDL3::SDL3 PROPERTIES
+        INTERFACE_COMPILE_OPTIONS "-sUSE_SDL=3"
+        INTERFACE_LINK_OPTIONS    "-sUSE_SDL=3")
+    set(SDL3_FOUND TRUE)
     add_library(ZLIB::ZLIB INTERFACE IMPORTED)
     set_target_properties(ZLIB::ZLIB PROPERTIES
         INTERFACE_COMPILE_OPTIONS "-sUSE_ZLIB=1"
@@ -383,7 +372,7 @@ elseif(EMSCRIPTEN)
         list(APPEND CMAKE_FIND_ROOT_PATH ${OPENSSL_ROOT_DIR})
     endif()
 else()
-    find_package(SDL2 REQUIRED)
+    find_package(SDL3 REQUIRED CONFIG)
 endif()
 if(NOT Vulkan_FOUND)
     find_package(Vulkan QUIET)
@@ -586,6 +575,10 @@ function(compile_shaders TARGET_NAME)
     file(MAKE_DIRECTORY ${SPV_DIR})
 
     file(GLOB GLSL_SOURCES "${SHADER_DIR}/*.glsl")
+    # Shared code lives in .glsli, which the glob above does not pick up. A
+    # shader that includes any of it is rebuilt when one changes; the rest are
+    # left alone, since their .spv are tracked and a rebuild rewrites them.
+    file(GLOB GLSL_INCLUDES "${SHADER_DIR}/*.glsli")
     set(SPV_OUTPUTS)
 
     foreach(GLSL_FILE ${GLSL_SOURCES})
@@ -608,14 +601,43 @@ function(compile_shaders TARGET_NAME)
             continue()
         endif()
 
+        file(STRINGS ${GLSL_FILE} SHADER_INCLUDES REGEX "^#include \"")
+        set(SHADER_DEPS ${GLSL_FILE})
+        if(SHADER_INCLUDES)
+            list(APPEND SHADER_DEPS ${GLSL_INCLUDES})
+        endif()
         add_custom_command(
             OUTPUT ${SPV_FILE}
             COMMAND ${GLSLC} -fshader-stage=${SHADER_STAGE} -O ${GLSL_FILE} -o ${SPV_FILE}
-            DEPENDS ${GLSL_FILE}
+            DEPENDS ${SHADER_DEPS}
             COMMENT "Compiling SPIR-V: ${FILE_NAME} -> ${SPV_NAME}"
             VERBATIM
         )
         list(APPEND SPV_OUTPUTS ${SPV_FILE})
+    endforeach()
+
+    # Extra builds of one source with different definitions: source, output,
+    # then the extra glslc arguments. Ray queries need SPIR-V 1.4 or later,
+    # hence the target environment on the hardware tracer.
+    set(SHADER_VARIANTS
+        "rt_prepare.comp.glsl|rt_prepare_ms.comp.spv|-DRT_MSAA"
+        "rt_trace.comp.glsl|rt_trace_hw.comp.spv|-DRT_HARDWARE --target-env=vulkan1.2"
+    )
+    foreach(VARIANT ${SHADER_VARIANTS})
+        string(REPLACE "|" ";" VARIANT_PARTS "${VARIANT}")
+        list(GET VARIANT_PARTS 0 VARIANT_SRC)
+        list(GET VARIANT_PARTS 1 VARIANT_OUT)
+        list(GET VARIANT_PARTS 2 VARIANT_ARGS)
+        separate_arguments(VARIANT_ARGS UNIX_COMMAND "${VARIANT_ARGS}")
+        add_custom_command(
+            OUTPUT ${SPV_DIR}/${VARIANT_OUT}
+            COMMAND ${GLSLC} -fshader-stage=compute ${VARIANT_ARGS} -O
+                    ${SHADER_DIR}/${VARIANT_SRC} -o ${SPV_DIR}/${VARIANT_OUT}
+            DEPENDS ${SHADER_DIR}/${VARIANT_SRC} ${GLSL_INCLUDES}
+            COMMENT "Compiling SPIR-V: ${VARIANT_SRC} -> ${VARIANT_OUT}"
+            VERBATIM
+        )
+        list(APPEND SPV_OUTPUTS ${SPV_DIR}/${VARIANT_OUT})
     endforeach()
 
     add_custom_target(${TARGET_NAME}_shaders ALL DEPENDS ${SPV_OUTPUTS})
@@ -635,7 +657,7 @@ if(EXISTS ${IMGUI_DIR})
         ${IMGUI_DIR}/imgui_tables.cpp
         ${IMGUI_DIR}/imgui_widgets.cpp
         ${IMGUI_DIR}/imgui_demo.cpp
-        ${IMGUI_DIR}/backends/imgui_impl_sdl2.cpp
+        ${IMGUI_DIR}/backends/imgui_impl_sdl3.cpp
         ${IMGUI_DIR}/backends/imgui_impl_vulkan.cpp
     )
     # SYSTEM: vendored, so -Werror on wowee does not police it.
@@ -643,7 +665,7 @@ if(EXISTS ${IMGUI_DIR})
         ${IMGUI_DIR}
         ${IMGUI_DIR}/backends
     )
-    target_link_libraries(imgui PUBLIC SDL2::SDL2 Vulkan::Vulkan ${CMAKE_DL_LIBS})
+    target_link_libraries(imgui PUBLIC SDL3::SDL3 Vulkan::Vulkan ${CMAKE_DL_LIBS})
 else()
     message(WARNING "ImGui not found in extern/imgui. Clone it with:")
     message(WARNING "  git clone https://github.com/ocornut/imgui.git extern/imgui")
@@ -672,6 +694,7 @@ endif()
 set(WOWEE_SOURCES
     # Core
     src/core/application.cpp
+    src/core/screen_recorder.cpp
     src/core/entity_spawner.cpp
     src/core/entity_spawner_player.cpp
     src/core/entity_spawner_processing.cpp
@@ -692,6 +715,9 @@ set(WOWEE_SOURCES
     src/core/memory_monitor.cpp
     src/core/app_clock.cpp
     src/core/config_paths.cpp
+    src/core/frame_pacer.cpp
+    src/core/https_get.cpp
+    src/core/update_check.cpp
 
     # Math
     src/math/spline.cpp
@@ -731,6 +757,7 @@ set(WOWEE_SOURCES
     src/game/inventory_handler.cpp
     src/game/social_handler.cpp
     src/game/quest_handler.cpp
+    src/game/quest_objectives.cpp
     src/game/entity_controller.cpp
     src/game/warden_handler.cpp
     src/game/warden_crypto.cpp
@@ -965,6 +992,9 @@ set(WOWEE_SOURCES
     src/rendering/shadow_params.cpp
     src/rendering/terrain_manager.cpp
     src/rendering/frustum.cpp
+    src/rendering/rt_bvh.cpp
+    src/rendering/rt_scene.cpp
+    src/rendering/rt_lighting.cpp
     src/rendering/performance_hud.cpp
     src/rendering/water_renderer.cpp
     src/rendering/skybox.cpp
@@ -990,6 +1020,10 @@ set(WOWEE_SOURCES
     src/rendering/m2_model_classifier.cpp
     src/rendering/render_graph.cpp
     src/rendering/hiz_system.cpp
+    src/rendering/volumetric_fog.cpp
+    src/rendering/sun_shafts.cpp
+    src/rendering/screen_capture.cpp
+    src/rendering/loot_sparkles.cpp
     src/rendering/grass_renderer.cpp
     src/pipeline/adt_alpha.cpp
     src/pipeline/grass_terrain.cpp
@@ -1000,6 +1034,7 @@ set(WOWEE_SOURCES
     src/rendering/quest_marker_renderer.cpp
     src/rendering/footprint_renderer.cpp
     src/rendering/minimap.cpp
+    src/rendering/aux_swapchain.cpp
     src/rendering/world_map/coordinate_projection.cpp
     src/rendering/world_map/map_resolver.cpp
     src/rendering/world_map/exploration_state.cpp
@@ -1043,6 +1078,7 @@ set(WOWEE_SOURCES
 
     # UI
     src/ui/ui_manager.cpp
+    src/ui/map_window.cpp
     src/ui/ui_upload_budget.cpp
     src/ui/widget_tree.cpp
     src/ui/xml_parser.cpp
@@ -1056,6 +1092,7 @@ set(WOWEE_SOURCES
     src/ui/ui_raid_icons.cpp
     src/ui/ui_texture_load.cpp
     src/ui/auth_screen.cpp
+    src/ui/first_run_screen.cpp
     src/ui/realm_screen.cpp
     src/ui/character_create_screen.cpp
     src/ui/character_screen.cpp
@@ -1425,7 +1462,7 @@ endif()
 
 # Link libraries
 target_link_libraries(wowee PRIVATE
-    SDL2::SDL2
+    SDL3::SDL3
     Vulkan::Vulkan
     OpenSSL::SSL
     OpenSSL::Crypto
@@ -1553,11 +1590,14 @@ if(APPLE)
     target_link_libraries(wowee PRIVATE "-framework Foundation")
 endif()
 if(WIN32)
-    target_link_libraries(wowee PRIVATE ws2_32)
-    # SDL2main provides WinMain entry point on Windows
-    if(TARGET SDL2::SDL2main)
-        target_link_libraries(wowee PRIVATE SDL2::SDL2main)
-    endif()
+    # winmm: timeBeginPeriod/timeEndPeriod, which the frame pacer uses to ask
+    # for a 1ms sleep granularity. Windows defaults to a 15.6ms timer tick -
+    # more than two whole frames at 144Hz - and without this the link fails
+    # on __imp_timeBeginPeriod rather than the cap simply being coarse.
+    #
+    # No SDL main library: SDL3 has none, its WinMain shim being header-only
+    # in SDL_main.h, where SDL2 kept it in a separate SDL2main.
+    target_link_libraries(wowee PRIVATE ws2_32 winmm)
 endif()
 
 # Link ImGui if available
@@ -1668,6 +1708,43 @@ endif()
 
 # ── Unit tests (Catch2) ──────────────────────────────────────
 if(WOWEE_BUILD_TESTS)
+# Defined here rather than beside the tools that use it: tests/ is added
+# below and a CMake function has to exist before the directory that calls
+# it is processed.
+# Everything a StormLib consumer has to link besides StormLib itself.
+#
+# A static libstorm leaves its own dependencies to whoever links it: bzip2
+# everywhere, and on Windows LibTomCrypt, LibTomMath and wininet as well. This
+# was written out once per tool, so mpq_build linked what asset_extract needed
+# minus the Windows half and failed to link there with fifteen undefined
+# symbols - md5_init, ltc_mp, InternetOpenA - none of which name StormLib.
+function(wowee_link_stormlib target)
+    target_link_libraries(${target} PRIVATE ${STORMLIB_LIBRARY} ZLIB::ZLIB Threads::Threads)
+    if(NOT WIN32)
+        find_library(BZ2_LIB NAMES bz2 bzip2)
+        if(BZ2_LIB)
+            target_link_libraries(${target} PRIVATE ${BZ2_LIB})
+        endif()
+    else()
+        find_library(WININET_LIB wininet)
+        find_library(BZ2_LIB bz2)
+        find_library(TOMCRYPT_LIB NAMES tomcrypt libtomcrypt)
+        find_library(TOMMATH_LIB NAMES tommath libtommath)
+        if(WININET_LIB)
+            target_link_libraries(${target} PRIVATE ${WININET_LIB})
+        endif()
+        if(BZ2_LIB)
+            target_link_libraries(${target} PRIVATE ${BZ2_LIB})
+        endif()
+        if(TOMCRYPT_LIB AND TOMMATH_LIB)
+            target_link_libraries(${target} PRIVATE ${TOMCRYPT_LIB} ${TOMMATH_LIB})
+        else()
+            message(FATAL_ERROR
+                "Static StormLib on Windows requires LibTomCrypt and LibTomMath")
+        endif()
+    endif()
+endfunction()
+
     enable_testing()
     add_subdirectory(tests)
 endif()
@@ -1807,7 +1884,10 @@ endif()
 #
 #     cmake -S . -B build -DWOWEE_BUILD_FRAMEXML_RUN=ON
 #     cmake --build build --target framexml_run
-#     ./build/bin/framexml_run Data 'ToggleGameMenu()'
+#     ./build/bin/framexml_run Data/expansions/wotlk 'ToggleGameMenu()'
+#
+# The expansion's directory, not the Data root: given the root it finds no
+# FrameXML, loads nothing, and reports no errors.
 option(WOWEE_BUILD_FRAMEXML_RUN
        "Build the headless FrameXML runner (tools/framexml_run.cpp)" OFF)
 if(WOWEE_BUILD_FRAMEXML_RUN)
@@ -1854,39 +1934,45 @@ if(WOWEE_BUILD_FRAMEXML_RUN)
     endif()
 endif()
 
-# Everything a StormLib consumer has to link besides StormLib itself.
-#
-# A static libstorm leaves its own dependencies to whoever links it: bzip2
-# everywhere, and on Windows LibTomCrypt, LibTomMath and wininet as well. This
-# was written out once per tool, so mpq_build linked what asset_extract needed
-# minus the Windows half and failed to link there with fifteen undefined
-# symbols - md5_init, ltc_mp, InternetOpenA - none of which name StormLib.
-function(wowee_link_stormlib target)
-    target_link_libraries(${target} PRIVATE ${STORMLIB_LIBRARY} ZLIB::ZLIB Threads::Threads)
-    if(NOT WIN32)
-        find_library(BZ2_LIB NAMES bz2 bzip2)
-        if(BZ2_LIB)
-            target_link_libraries(${target} PRIVATE ${BZ2_LIB})
-        endif()
-    else()
-        find_library(WININET_LIB wininet)
-        find_library(BZ2_LIB bz2)
-        find_library(TOMCRYPT_LIB NAMES tomcrypt libtomcrypt)
-        find_library(TOMMATH_LIB NAMES tommath libtommath)
-        if(WININET_LIB)
-            target_link_libraries(${target} PRIVATE ${WININET_LIB})
-        endif()
-        if(BZ2_LIB)
-            target_link_libraries(${target} PRIVATE ${BZ2_LIB})
-        endif()
-        if(TOMCRYPT_LIB AND TOMMATH_LIB)
-            target_link_libraries(${target} PRIVATE ${TOMCRYPT_LIB} ${TOMMATH_LIB})
-        else()
-            message(FATAL_ERROR
-                "Static StormLib on Windows requires LibTomCrypt and LibTomMath")
-        endif()
+
+# ---- Tool: rt_probe ----
+# The ray traced lighting pass run once against a scene with a known answer
+# on this machine's Vulkan device, without a realm to stand in. Built from the
+# client's own sources like framexml_run, for the same reason.
+option(WOWEE_BUILD_RT_PROBE "Build the ray traced lighting probe (tools/rt_probe.cpp)" OFF)
+if(WOWEE_BUILD_RT_PROBE)
+    set(WOWEE_RT_PROBE_SOURCES ${WOWEE_SOURCES})
+    list(REMOVE_ITEM WOWEE_RT_PROBE_SOURCES src/main.cpp)
+    add_executable(rt_probe
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/rt_probe.cpp
+        ${WOWEE_RT_PROBE_SOURCES}
+        ${WOWEE_PLATFORM_SOURCES}
+        ${WOWEE_MACOS_SOURCES}
+    )
+    get_target_property(_rtp_libs wowee LINK_LIBRARIES)
+    get_target_property(_rtp_incs wowee INCLUDE_DIRECTORIES)
+    get_target_property(_rtp_defs wowee COMPILE_DEFINITIONS)
+    get_target_property(_rtp_libdirs wowee LINK_DIRECTORIES)
+    if(_rtp_libs)
+        target_link_libraries(rt_probe PRIVATE ${_rtp_libs})
     endif()
-endfunction()
+    if(_rtp_libdirs)
+        target_link_directories(rt_probe PRIVATE ${_rtp_libdirs})
+    endif()
+    if(_rtp_incs)
+        target_include_directories(rt_probe PRIVATE ${_rtp_incs})
+    endif()
+    if(_rtp_defs)
+        target_compile_definitions(rt_probe PRIVATE ${_rtp_defs})
+    endif()
+    target_include_directories(rt_probe SYSTEM PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/extern
+        ${CMAKE_CURRENT_SOURCE_DIR}/extern/vk-bootstrap/src)
+    add_dependencies(rt_probe wowee_version wowee_shaders)
+    if(TARGET opcodes-generate)
+        add_dependencies(rt_probe opcodes-generate)
+    endif()
+endif()
 
 # ---- Tool: mpq_build (loose files → MPQ) ----
 # The reverse of asset_extract, and not for WoWee, which reads loose files: for
@@ -1942,6 +2028,11 @@ if(STORMLIB_LIBRARY AND STORMLIB_INCLUDE_DIR)
         ${CMAKE_CURRENT_SOURCE_DIR}/extern
     )
     wowee_link_stormlib(asset_extract)
+    if(WIN32)
+        # ShellExecuteW, for handing a double-click over to the asset manager
+        # window instead of printing a usage message at a console that closes.
+        target_link_libraries(asset_extract PRIVATE shell32)
+    endif()
     set_target_properties(asset_extract PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
@@ -1953,7 +2044,7 @@ endif()
 
 # ---- Tool: wowee_assets (the asset manager window) ----
 #
-# A native window for building this client's assets: SDL2 and Dear ImGui, both
+# A native window for building this client's assets: SDL3 and Dear ImGui, both
 # of which the client already carries, and Extractor::run called in this
 # process. It replaces a Tkinter window that drove shell scripts that drove
 # Python scripts - a chain where every link was a thing to have installed, and
@@ -1961,25 +2052,32 @@ endif()
 #
 # SDL's own renderer rather than Vulkan or GL: this draws a form and a log, and
 # the backend that needs no API choice is the one that builds everywhere.
-if(STORMLIB_LIBRARY AND STORMLIB_INCLUDE_DIR AND SDL2_FOUND AND EXISTS ${IMGUI_DIR}/imgui.cpp)
+if(STORMLIB_LIBRARY AND STORMLIB_INCLUDE_DIR AND SDL3_FOUND AND EXISTS ${IMGUI_DIR}/imgui.cpp)
     add_library(imgui_sdlrenderer STATIC
         ${IMGUI_DIR}/imgui.cpp
         ${IMGUI_DIR}/imgui_draw.cpp
         ${IMGUI_DIR}/imgui_tables.cpp
         ${IMGUI_DIR}/imgui_widgets.cpp
-        ${IMGUI_DIR}/backends/imgui_impl_sdl2.cpp
-        ${IMGUI_DIR}/backends/imgui_impl_sdlrenderer2.cpp
+        ${IMGUI_DIR}/backends/imgui_impl_sdl3.cpp
+        ${IMGUI_DIR}/backends/imgui_impl_sdlrenderer3.cpp
     )
     target_include_directories(imgui_sdlrenderer SYSTEM PUBLIC
         ${IMGUI_DIR} ${IMGUI_DIR}/backends
     )
-    target_link_libraries(imgui_sdlrenderer PUBLIC SDL2::SDL2)
+    target_link_libraries(imgui_sdlrenderer PUBLIC SDL3::SDL3)
 
-    add_executable(wowee_assets
+    # WIN32: a windowed program rather than a console one, so double-clicking
+    # it in Explorer opens the window and nothing else. Without it Windows
+    # gives this a console too, and the asset manager came up beside a black
+    # cmd box it never writes to. The keyword is ignored everywhere but
+    # Windows. Startup failures go to a message box now that there is no
+    # console to print them to.
+    add_executable(wowee_assets WIN32
         # The icon resource, so this is not a blank executable in Explorer and
         # on the Start menu entry the installer makes for it. Empty off Windows.
         ${WOWEE_PLATFORM_SOURCES}
         tools/asset_manager/main.cpp
+        tools/asset_manager/panel.cpp
         tools/asset_manager/profiles.cpp
         tools/asset_manager/install_scan.cpp
         tools/asset_manager/install_probe.cpp
@@ -2022,12 +2120,8 @@ if(STORMLIB_LIBRARY AND STORMLIB_INCLUDE_DIR AND SDL2_FOUND AND EXISTS ${IMGUI_D
     elseif(WIN32)
         target_sources(wowee_assets PRIVATE tools/asset_manager/folder_picker_win.cpp)
         target_link_libraries(wowee_assets PRIVATE ole32 shell32)
-        # SDL.h redefines main, and SDL2main is what supplies the WinMain that
-        # calls it. Without this the link ends at "undefined reference to
-        # WinMain" - which the client and the editor both already link for.
-        if(TARGET SDL2::SDL2main)
-            target_link_libraries(wowee_assets PRIVATE SDL2::SDL2main)
-        endif()
+        # No SDL main library to link: SDL3's WinMain shim is header-only, in
+        # SDL_main.h, where SDL2 kept it in SDL2main.
     else()
         target_sources(wowee_assets PRIVATE tools/asset_manager/folder_picker_none.cpp)
     endif()
@@ -2048,7 +2142,68 @@ if(STORMLIB_LIBRARY AND STORMLIB_INCLUDE_DIR AND SDL2_FOUND AND EXISTS ${IMGUI_D
     install(TARGETS wowee_assets RUNTIME DESTINATION bin)
     message(STATUS "  wowee_assets window: ENABLED")
 else()
-    message(STATUS "  wowee_assets window: DISABLED (needs StormLib, SDL2 and extern/imgui)")
+    message(STATUS "  wowee_assets window: DISABLED (needs StormLib, SDL3 and extern/imgui)")
+endif()
+
+# ---- The same panel, inside the client ----
+#
+# Somebody who has just installed WoWee and has extracted nothing reaches a
+# login screen it cannot get past: the callbacks that would carry them
+# through are the ones that need assets, so they can type an account and
+# nothing happens. The program that fixes that was a separate executable they
+# had to know to go and find. The client carries it now, drawn from the same
+# panel.cpp the window draws, through its own Vulkan-backed ImGui.
+#
+# Gated on what the window is gated on. Without StormLib there is nothing to
+# extract with, and a client built without it should still be a client - the
+# screen is compiled out and the old behaviour stands.
+if(TARGET wowee AND STORMLIB_LIBRARY AND STORMLIB_INCLUDE_DIR AND EXISTS ${IMGUI_DIR}/imgui.cpp)
+    target_sources(wowee PRIVATE
+        tools/asset_manager/panel.cpp
+        tools/asset_manager/profiles.cpp
+        tools/asset_manager/install_scan.cpp
+        tools/asset_manager/install_probe.cpp
+        tools/asset_manager/job.cpp
+        tools/asset_manager/casc.cpp
+        tools/asset_manager/texture_ops.cpp
+        tools/asset_manager/upscale.cpp
+        tools/asset_manager/pack.cpp
+        tools/asset_manager/model_import.cpp
+        tools/asset_manager/model_source.cpp
+        tools/asset_manager/folder_picker.cpp
+        tools/asset_extract/extractor.cpp
+        tools/asset_extract/path_mapper.cpp
+        tools/asset_extract/manifest_writer.cpp
+        tools/asset_extract/open_format_emitter.cpp
+    )
+    # The same per-platform choice the window makes, for the same reasons.
+    if(APPLE)
+        target_sources(wowee PRIVATE tools/asset_manager/folder_picker_mac.mm)
+        # SKIP_PRECOMPILE_HEADERS: the client's objcxx PCH is built without
+        # ARC and this file needs it on, which the compiler refuses to mix.
+        set_source_files_properties(tools/asset_manager/folder_picker_mac.mm
+            PROPERTIES COMPILE_FLAGS "-fobjc-arc" SKIP_PRECOMPILE_HEADERS ON)
+        target_link_libraries(wowee PRIVATE
+            "-framework AppKit" "-framework UniformTypeIdentifiers")
+    elseif(WIN32)
+        target_sources(wowee PRIVATE tools/asset_manager/folder_picker_win.cpp)
+        target_link_libraries(wowee PRIVATE ole32 shell32)
+    else()
+        target_sources(wowee PRIVATE tools/asset_manager/folder_picker_none.cpp)
+    endif()
+    target_include_directories(wowee PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/asset_manager
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/asset_extract
+        ${STORMLIB_INCLUDE_DIR}
+    )
+    # renderer.cpp already compiles stb_image_write for its screenshots, and
+    # open_format_emitter.cpp compiles it for every other binary it is in.
+    target_compile_definitions(wowee PRIVATE
+        WOWEE_HAVE_ASSET_PANEL WOWEE_STB_IMAGE_WRITE_PROVIDED)
+    wowee_link_stormlib(wowee)
+    message(STATUS "  asset panel in the client: ENABLED")
+else()
+    message(STATUS "  asset panel in the client: DISABLED (needs StormLib and extern/imgui)")
 endif()
 
 # ---- Tool: dbc_to_csv (DBC → CSV text) ----
@@ -2582,6 +2737,10 @@ add_executable(wowee_editor
     src/rendering/bone_slots.cpp
     src/rendering/normal_map.cpp
     src/rendering/frustum.cpp
+    src/rendering/rt_bvh.cpp
+    src/rendering/rt_scene.cpp
+    src/rendering/rt_lighting.cpp
+    src/rendering/volumetric_fog.cpp
 
     # Core
     src/core/window.cpp
@@ -2603,7 +2762,7 @@ target_include_directories(wowee_editor SYSTEM PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/extern/vk-bootstrap/src
 )
 target_link_libraries(wowee_editor PRIVATE
-    SDL2::SDL2
+    SDL3::SDL3
     Vulkan::Vulkan
     Threads::Threads
     ZLIB::ZLIB
@@ -2629,9 +2788,7 @@ if(APPLE)
 endif()
 if(WIN32)
     target_link_libraries(wowee_editor PRIVATE ws2_32)
-    if(TARGET SDL2::SDL2main)
-        target_link_libraries(wowee_editor PRIVATE SDL2::SDL2main)
-    endif()
+    # SDL3 has no separate main library; see the client target.
 endif()
 if(NOT MSVC)
     # The editor's CLI handlers share a `(int& i, int argc, char** argv)`
@@ -2670,7 +2827,7 @@ message(STATUS "")
 message(STATUS "Wowee Configuration:")
 message(STATUS "  C++ Standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "  Build Type: ${CMAKE_BUILD_TYPE}")
-message(STATUS "  SDL2: ${SDL2_VERSION}")
+message(STATUS "  SDL3: ${SDL3_VERSION}")
 message(STATUS "  OpenSSL: ${OPENSSL_VERSION}")
 message(STATUS "  ImGui: ${IMGUI_DIR}")
 message(STATUS "  ASAN: ${WOWEE_ENABLE_ASAN}")
@@ -2752,7 +2909,7 @@ chmod +x /usr/local/bin/wowee
     set(CPACK_DEBIAN_PACKAGE_MAINTAINER "Wowee")
     set(CPACK_DEBIAN_PACKAGE_SECTION "games")
     set(CPACK_DEBIAN_PACKAGE_DEPENDS
-        "libsdl2-2.0-0, libvulkan1, libssl3, zlib1g")
+        "libsdl3-0, libvulkan1, libssl3, zlib1g")
     set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
         "${CMAKE_CURRENT_BINARY_DIR}/packaging/postinst;${CMAKE_CURRENT_BINARY_DIR}/packaging/prerm")
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")

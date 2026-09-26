@@ -1,6 +1,7 @@
 #include <cstring>
 #include "ui/widget_renderer.hpp"
 #include "ui/text_markup.hpp"
+#include "ui/simple_html.hpp"
 #include "ui/link_hit.hpp"
 #include "ui/text_wrap.hpp"
 #include <deque>
@@ -572,12 +573,12 @@ void WidgetRenderer::sizeArtAndText(WidgetTree& tree) {
 
 
 
-void WidgetRenderer::drawMarkupText(ImDrawList* dl, ImFont* font, float size,
-                                    ImVec2 at, uint32_t fallback, float alpha,
-                                    const std::string& text, float wrapWidth,
-                                    bool nonSpaceWrap, const char* justifyH,
-                                    bool forceColor, WidgetTree* linkSink,
-                                    uint32_t linkOwner) {
+float WidgetRenderer::drawMarkupText(ImDrawList* dl, ImFont* font, float size,
+                                     ImVec2 at, uint32_t fallback, float alpha,
+                                     const std::string& text, float wrapWidth,
+                                     bool nonSpaceWrap, const char* justifyH,
+                                     bool forceColor, WidgetTree* linkSink,
+                                     uint32_t linkOwner) {
     const auto lines = wrapText(parseMarkup(text), wrapWidth, nonSpaceWrap,
                                 [&](const std::string& piece) {
                                     return font->CalcTextSizeA(size, FLT_MAX, 0.0f,
@@ -657,6 +658,74 @@ void WidgetRenderer::drawMarkupText(ImDrawList* dl, ImFont* font, float size,
             x += runW;
         }
         y += lineH;
+    }
+    return y - at.y;
+}
+
+void WidgetRenderer::drawSimpleHtml(ImDrawList* dl, WidgetTree& tree,
+                                    const Widget& w, float ws,
+                                    float x0, float y0, float x1) {
+    ImFont* font = interfaceFaceOrDefault(w.fontFace);
+    const float size = interfaceFontSize(w.fontHeight) * ws;
+    const float boxW = x1 - x0;
+    const float wrapW = boxW > size ? boxW : 0.0f;
+    float y = y0;
+    for (const HtmlBlock& b : parseSimpleHtml(w.text)) {
+        const std::string& align = b.align.empty() ? w.justifyH : b.align;
+        if (b.kind == HtmlBlock::Kind::Image) {
+            // The size the tag asked for, the picture's own where it asked
+            // nothing, and the other side in proportion where it gave one.
+            float iw = 0.0f, ih = 0.0f;
+            textureSize(b.src, iw, ih);
+            float dw = b.width, dh = b.height;
+            if (dw <= 0.0f && dh <= 0.0f) { dw = iw; dh = ih; }
+            else if (dw <= 0.0f) dw = ih > 0.0f ? dh * iw / ih : dh;
+            else if (dh <= 0.0f) dh = iw > 0.0f ? dw * ih / iw : dw;
+            dw *= ws;
+            dh *= ws;
+            if (dw <= 0.0f || dh <= 0.0f) {
+                // Nothing to size it by: the tag gave no size and the file
+                // could not be read. Said once, or it is just a gap.
+                static std::set<std::string> saidPicture;
+                if (saidPicture.insert(b.src).second) {
+                    LOG_WARNING("SimpleHTML '", w.name.empty() ? "(unnamed)" : w.name,
+                                "': picture '", b.src, "' does not resolve and "
+                                "the tag gives no size, so it is left out");
+                }
+                continue;
+            }
+            // Never wider than the page, and narrowed in proportion so the
+            // picture is smaller rather than squashed.
+            if (boxW > 0.0f && dw > boxW) { dh *= boxW / dw; dw = boxW; }
+            float ix = x0;
+            if (align == "CENTER") ix = x0 + (boxW - dw) * 0.5f;
+            else if (align == "RIGHT") ix = x1 - dw;
+            VkDescriptorSet tex = resident(b.src);
+            if (tex != kMissing) {
+                dl->AddImage(reinterpret_cast<ImTextureID>(tex), ImVec2(ix, y),
+                             ImVec2(ix + dw, y + dh), ImVec2(0, 0), ImVec2(1, 1),
+                             IM_COL32(255, 255, 255,
+                                      static_cast<int>(w.alpha * 255.0f)));
+            }
+            y += dh;
+            continue;
+        }
+        if (w.hasShadow) {
+            float sc[4] = {w.shadowColor[0], w.shadowColor[1],
+                           w.shadowColor[2], w.shadowColor[3]};
+            drawMarkupText(dl, font, size,
+                           ImVec2(x0 + w.shadowX * ws, y - w.shadowY * ws),
+                           packColor(sc, w.alpha * w.shadowColor[3]), w.alpha,
+                           b.text, wrapW, false, align.c_str(), true);
+        }
+        float h = drawMarkupText(dl, font, size, ImVec2(x0, y),
+                                 packColor(w.color, w.alpha), w.alpha, b.text,
+                                 wrapW, false, align.c_str(), false, &tree, w.id);
+        // A break at the end of a block finishes its last line rather than
+        // opening another: "text<BR/></P>" is one line, and a lone <BR/>
+        // between paragraphs is one blank line, not two.
+        if (!b.text.empty() && b.text.back() == '\n') h -= size * 1.2f;
+        y += h;
     }
 }
 
@@ -1266,6 +1335,14 @@ void WidgetRenderer::reportOverflowingText(WidgetTree& tree) {
         const Widget* w = tree.get(static_cast<uint32_t>(id));
         if (!w || w->kind != WidgetKind::FontString) continue;
         if (!w->autoSized || w->text.empty() || w->rectW <= 0.0f) continue;
+        // On screen only. A hidden label's rect is whatever it was last solved
+        // to, and the full pass does not solve hidden frames - so one measured
+        // on demand while its page was still being built keeps that answer.
+        // The retired voice chat page was reported at every login this way:
+        // its message was measured inside a one-unit frame during OnLoad, the
+        // frame was then sized to the text, and the page was never shown to
+        // lay out again.
+        if (!w->visible) continue;
 
         // Against the width this label was measured to need, not against a
         // fresh measurement: a label stretched between two anchors is given
@@ -1461,9 +1538,20 @@ void WidgetRenderer::reportWidgetDiagnostics(WidgetTree& tree,
             }
         }
 
+        // The whole report at warning when somebody typed /fxcheck, and at
+        // debug when it runs by itself at load and on entering the world: two
+        // screens of frame states on every session, in a log whose warnings are
+        // meant to be the things worth reading. WOWEE_LOG_LEVEL=debug brings the
+        // automatic ones back.
+        const core::LogLevel checkLevel =
+            askedFor ? core::LogLevel::WARNING : core::LogLevel::DEBUG;
+        auto report = [checkLevel](auto&&... parts) {
+            core::Logger::getInstance().at(checkLevel,
+                                           std::forward<decltype(parts)>(parts)...);
+        };
         const std::vector<std::string> wanted = frameXmlCheckFrames();
         if (!wanted.empty()) {
-            LOG_WARNING("FrameXML takeover check ", when, ", on ", screenW, "x", screenH,
+            report("FrameXML takeover check ", when, ", on ", screenW, "x", screenH,
                         " px (scale ", s, "):");
             // Anything that landed off the screen, whoever it belongs to.
             //
@@ -1481,10 +1569,10 @@ void WidgetRenderer::reportWidgetDiagnostics(WidgetTree& tree,
                 const float t = (w->bottom + w->rectH) * s;
                 if (l < screenW && r > 0.0f && b < screenH && t > 0.0f) continue;
                 if (++offscreen > 12) break;
-                LOG_WARNING("  OFF SCREEN ", w->name, " rect=(", w->left, ",",
+                report("  OFF SCREEN ", w->name, " rect=(", w->left, ",",
                             w->bottom, " ", w->rectW, "x", w->rectH, ")");
             }
-            if (offscreen > 12) LOG_WARNING("  ... and more");
+            if (offscreen > 12) report("  ... and more");
 
             // Shown, and no size to be shown at.
             //
@@ -1514,11 +1602,11 @@ void WidgetRenderer::reportWidgetDiagnostics(WidgetTree& tree,
                     if (w->width <= 0.0f && w->height <= 0.0f) continue;
                     if (w->rectW > 0.0f && w->rectH > 0.0f) continue;
                     if (++flat > 10) break;
-                    LOG_WARNING("  NO SIZE ", w->name, " asks for ", w->width,
+                    report("  NO SIZE ", w->name, " asks for ", w->width,
                                 "x", w->height, " and resolves to ", w->rectW,
                                 "x", w->rectH, " (scale ", w->effScale, ")");
                 }
-                if (flat > 10) LOG_WARNING("  ... and more");
+                if (flat > 10) report("  ... and more");
             }
 
             // Visible, named, and anchored to nothing.
@@ -1551,7 +1639,7 @@ void WidgetRenderer::reportWidgetDiagnostics(WidgetTree& tree,
                     // intended.
                     if (name == "UIParent" || name == "WorldFrame") continue;
                     if (++dupes > 10) break;
-                    LOG_WARNING("  DUPLICATE ", name, " - ", count,
+                    report("  DUPLICATE ", name, " - ", count,
                                 " visible widgets share this name");
                 }
             }
@@ -1575,7 +1663,7 @@ void WidgetRenderer::reportWidgetDiagnostics(WidgetTree& tree,
                     if (!w || !w->visible || w->kind != WidgetKind::FontString) continue;
                     if (w->text.size() < 3 || texts[w->text] < 2) continue;
                     ++pairs;
-                    LOG_WARNING("  SAME TEXT \"", w->text, "\" on ",
+                    report("  SAME TEXT \"", w->text, "\" on ",
                                 w->name.empty() ? "(unnamed)" : w->name.c_str(),
                                 " rect=(", w->left, ",", w->bottom, " ",
                                 w->rectW, "x", w->rectH, ")");
@@ -1612,7 +1700,7 @@ void WidgetRenderer::reportWidgetDiagnostics(WidgetTree& tree,
                                                        b->rectW * b->rectH);
                         if (smaller <= 0.0f || (ox * oy) < smaller * 0.5f) continue;
                         ++overlaps;
-                        LOG_WARNING("  OVERLAPPING LABELS ",
+                        report("  OVERLAPPING LABELS ",
                                     a->name.empty() ? "(unnamed)" : a->name.c_str(),
                                     " \"", a->text, "\" over ",
                                     b->name.empty() ? "(unnamed)" : b->name.c_str(),
@@ -1638,7 +1726,7 @@ void WidgetRenderer::reportWidgetDiagnostics(WidgetTree& tree,
                     const bool hasWords = !w->text.empty() || !w->editText.empty() ||
                                           !w->tooltipLines.empty();
                     if (!hasWords) continue;
-                    LOG_WARNING("  OVER THE ARROWS ",
+                    report("  OVER THE ARROWS ",
                                 w->name.empty() ? "(unnamed)" : w->name.c_str(),
                                 " kind=", static_cast<int>(w->kind),
                                 " text=\"", w->text, "\" edit=\"", w->editText,
@@ -1664,7 +1752,7 @@ void WidgetRenderer::reportWidgetDiagnostics(WidgetTree& tree,
                     if (w->left > sheet->left + sheet->rectW) continue;
                     if (w->bottom > sheet->bottom + sheet->rectH) continue;
                     ++listed;
-                    LOG_WARNING("  SHEET LABEL ",
+                    report("  SHEET LABEL ",
                                 w->name.empty() ? "(unnamed)" : w->name.c_str(),
                                 " \"", w->text, "\" rect=(", w->left, ",", w->bottom,
                                 " ", w->rectW, "x", w->rectH, ")");
@@ -1678,10 +1766,10 @@ void WidgetRenderer::reportWidgetDiagnostics(WidgetTree& tree,
                     const std::string tabName = "CharacterFrameTab" + std::to_string(i);
                     const Widget* tab = tree.findByName(tabName);
                     if (!tab) {
-                        LOG_WARNING("  SHEET TAB ", tabName, " NOT BUILT");
+                        report("  SHEET TAB ", tabName, " NOT BUILT");
                         continue;
                     }
-                    LOG_WARNING("  SHEET TAB ", tabName,
+                    report("  SHEET TAB ", tabName,
                                 tab->shown ? " shown" : " HIDDEN",
                                 tab->enabled ? " enabled" : " DISABLED",
                                 " rect=(", tab->left, ",", tab->bottom,
@@ -1701,10 +1789,10 @@ void WidgetRenderer::reportWidgetDiagnostics(WidgetTree& tree,
                     if (w->rectW >= screenW / s - 1.0f) continue;
                 }
                 if (++orphans > 10) break;
-                LOG_WARNING("  UNANCHORED ", w->name, " rect=(", w->left, ",",
+                report("  UNANCHORED ", w->name, " rect=(", w->left, ",",
                             w->bottom, " ", w->rectW, "x", w->rectH, ")");
             }
-            if (orphans > 10) LOG_WARNING("  ... and more");
+            if (orphans > 10) report("  ... and more");
 
             // The next elements, so readiness can be judged before the
             // client's own version is hidden and there is no way back within
@@ -1719,7 +1807,7 @@ void WidgetRenderer::reportWidgetDiagnostics(WidgetTree& tree,
             for (const std::string& name : all) {
                 const bool candidate = (index++ >= firstCandidate);
                 if (askedFor && candidate && index == firstCandidate + 1) {
-                    LOG_WARNING("  -- not handed over yet, for readiness --");
+                    report("  -- not handed over yet, for readiness --");
                 }
                 const Widget* w = tree.findByName(name);
                 if (!w) {
@@ -1729,10 +1817,10 @@ void WidgetRenderer::reportWidgetDiagnostics(WidgetTree& tree,
                     // pass it is not worth a line at all.
                     if (frameXmlBuiltOnDemand(name)) {
                         if (askedFor) {
-                            LOG_WARNING("  ", name, " - not built yet (created when needed)");
+                            report("  ", name, " - not built yet (created when needed)");
                         }
                     } else {
-                        LOG_WARNING("  ", name, " - NOT BUILT");
+                        report("  ", name, " - NOT BUILT");
                     }
                     continue;
                 }
@@ -1810,7 +1898,7 @@ void WidgetRenderer::reportWidgetDiagnostics(WidgetTree& tree,
                      w->externalTexture == 0 && !w->texturePath.empty() &&
                      resident(w->texturePath, w->blendAdd) == kMissing);
                 if (!askedFor && !troubled) { ++quiet; continue; }
-                LOG_WARNING("  ", name,
+                report("  ", name,
                             (w->visible ? " shown" : " HIDDEN"), mouse, kindName, anchors,
                             stack, bar, label, slice,
                             (w->rectW <= 0.0f || w->rectH <= 0.0f ? " NOSIZE" : ""),
@@ -1835,7 +1923,7 @@ void WidgetRenderer::reportWidgetDiagnostics(WidgetTree& tree,
                             (w->texturePath.empty() ? "" : " tex="), w->texturePath);
             }
             if (quiet > 0) {
-                LOG_WARNING("  and ", quiet, " more built, sized and on screen"
+                report("  and ", quiet, " more built, sized and on screen"
                             " (/fxcheck for the full roll call)");
             }
         }
@@ -2079,6 +2167,17 @@ void WidgetRenderer::draw(WidgetTree& tree, float screenW, float screenH) {
             wantMarkup(line.right);
         }
         for (const auto& m : w->messages) wantMarkup(m.text);
+        // A page's pictures are named in its HTML, which is neither a field
+        // of their own nor a |T escape, so neither of the above sees them.
+        if (w->isSimpleHtml && looksLikeSimpleHtml(w->text)) {
+            for (const HtmlBlock& b : parseSimpleHtml(w->text)) {
+                if (b.kind != HtmlBlock::Kind::Image) continue;
+                if (static_cast<int>(wanted.size()) >= kUploadsPerFrame) break;
+                if (cachedTexture(b.src, false)) continue;
+                markupPaths.push_back(b.src);
+                want(markupPaths.back());
+            }
+        }
         if (w->kind == WidgetKind::Frame) {
             if (w->hasBackdrop) { want(w->bgFile); want(w->edgeFile); }
             if (w->isStatusBar) want(w->barTexture);
@@ -2512,7 +2611,9 @@ void WidgetRenderer::draw(WidgetTree& tree, float screenW, float screenH) {
                                 ", visible=", w->visible ? 1 : 0);
                 }
             }
-            if (w->isSimpleHtml && !w->text.empty()) {
+            if (w->isSimpleHtml && looksLikeSimpleHtml(w->text)) {
+                drawSimpleHtml(dl, tree, *w, ws, x0, y0, x1);
+            } else if (w->isSimpleHtml && !w->text.empty()) {
                 ImFont* font = interfaceFaceOrDefault(w->fontFace);
                 const float size = interfaceFontSize(w->fontHeight) * ws;
                 const float wrapW = (x1 - x0) > size ? (x1 - x0) : 0.0f;
@@ -2877,8 +2978,26 @@ void WidgetRenderer::draw(WidgetTree& tree, float screenW, float screenH) {
                 }
             }
             const float boxW = x1 - x0, boxH = y1 - y0;
+            // Too long, on one line, for the box it was given: cut at the end
+            // with "...", as WoW does, and set from the box's left edge
+            // whatever the justification. Justified as it was, a right-aligned
+            // label started out past the left of its box and lost its first
+            // characters to the clip - the video options' resolution read
+            // "920x1080 (Wide)", 90 units of text in an 85-unit box.
+            //
+            // Plain text only. A label with markup keeps its runs and is only
+            // moved, so it still loses its end rather than its start.
+            const bool overflows = clipToBox && wrapW <= 0.0f && extent.x > boxW + 0.5f;
+            std::string fitted;
+            if (overflows && font && measured == w->text &&
+                w->text.find('\n') == std::string::npos) {
+                fitted = fitWithEllipsis(w->text, boxW, [&](const std::string& piece) {
+                    return font->CalcTextSizeA(size, FLT_MAX, 0.0f, piece.c_str()).x;
+                });
+            }
+            const std::string& shown = fitted.empty() ? w->text : fitted;
             float tx = x0;
-            if (wrapW <= 0.0f) {
+            if (wrapW <= 0.0f && !overflows) {
                 if (w->justifyH == "CENTER")     tx = x0 + (boxW - extent.x) * 0.5f;
                 else if (w->justifyH == "RIGHT") tx = x1 - extent.x;
             }
@@ -2905,7 +3024,7 @@ void WidgetRenderer::draw(WidgetTree& tree, float screenW, float screenH) {
                     // copy of the words in a darker shade, out of line with
                     // the ones on top of it.
                     drawMarkupText(dl, font, size, ImVec2(tx + o.x, ty + o.y),
-                                   shadow, w->alpha, w->text, wrapW,
+                                   shadow, w->alpha, shown, wrapW,
                                    w->nonSpaceWrap, w->justifyH.c_str(), true);
                 }
             }
@@ -2919,7 +3038,7 @@ void WidgetRenderer::draw(WidgetTree& tree, float screenW, float screenH) {
                 drawMarkupText(dl, font, size,
                                ImVec2(tx + w->shadowX * s, ty - w->shadowY * s),
                                packColor(sc, w->alpha * w->shadowColor[3]),
-                               w->alpha, w->text, wrapW, w->nonSpaceWrap,
+                               w->alpha, shown, wrapW, w->nonSpaceWrap,
                                w->justifyH.c_str(), true);
             }
             // A button's label takes its colour from the button's state. The
@@ -2936,7 +3055,7 @@ void WidgetRenderer::draw(WidgetTree& tree, float screenW, float screenH) {
                 }
             }
             drawMarkupText(dl, font, size, ImVec2(tx, ty),
-                           packColor(textColor, w->alpha), w->alpha, w->text,
+                           packColor(textColor, w->alpha), w->alpha, shown,
                            wrapW, w->nonSpaceWrap, w->justifyH.c_str(), false,
                            &tree, w->id);
         }

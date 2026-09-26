@@ -38,6 +38,12 @@
 #include "pipeline/grass_terrain.hpp"
 #include "rendering/grass_renderer.hpp"
 #include "rendering/hiz_system.hpp"
+#include "rendering/volumetric_fog.hpp"
+#include "rendering/sun_shafts.hpp"
+#include "rendering/rt_lighting.hpp"
+#include "rendering/rt_scene.hpp"
+#include "rendering/screen_capture.hpp"
+#include "rendering/loot_sparkles.hpp"
 #include "rendering/minimap.hpp"
 #include "rendering/world_map.hpp"
 #include "rendering/quest_marker_renderer.hpp"
@@ -228,12 +234,40 @@ bool Renderer::createPerFrameResources() {
         }
     }
 
-    // --- Create descriptor set layout for set 0 (per-frame UBO + shadow sampler) ---
-    VkDescriptorSetLayoutBinding bindings[2]{};
+    // The fog's sampler and neutral volume come first: the layout below bakes
+    // the one in, and every set written below binds the other until the fog
+    // has volumes of its own.
+    volumetricFog_ = std::make_unique<VolumetricFog>();
+    if (!volumetricFog_->initialize(vkCtx)) {
+        LOG_ERROR("Failed to create the volumetric fog's sampler and neutral volume");
+        return false;
+    }
+
+    // The ray traced lighting's scene and pass. They outlive the per-frame
+    // sets: the renderers register geometry with the scene as they load, and
+    // bindings 3 and 4 below take the pass's sampler as immutable.
+    if (!rtScene_) {
+        rtScene_ = std::make_unique<RtScene>();
+        if (!rtScene_->initialize(vkCtx)) {
+            LOG_ERROR("Failed to create the ray tracing scene");
+            return false;
+        }
+        rtLighting_ = std::make_unique<RtLighting>();
+        if (!rtLighting_->initialize(vkCtx, rtScene_.get())) {
+            LOG_ERROR("Failed to create the ray traced lighting");
+            return false;
+        }
+    }
+
+    // --- Create descriptor set layout for set 0 (per-frame UBO + shadow sampler + fog volume
+    //     + ray traced lighting) ---
+    VkDescriptorSetLayoutBinding bindings[5]{};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bindings[0].descriptorCount = 1;
-    bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    // Compute as well: the fog volume is lit from this same block.
+    bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
+                             VK_SHADER_STAGE_COMPUTE_BIT;
     bindings[1].binding = 1;
     bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     bindings[1].descriptorCount = 1;
@@ -244,10 +278,30 @@ bool Renderer::createPerFrameResources() {
     // only legal here, baked into the layout, rather than written into the
     // descriptor per frame. shadowSampler is created above this point.
     bindings[1].pImmutableSamplers = &shadowSampler;
+    // The fog volume, read per fragment by surfaces and per vertex by
+    // particles and ribbons. Immutable like binding 1, so a set allocated
+    // anywhere else - the character preview's - only has to name a view.
+    const VkSampler fogSampler = volumetricFog_->getSampler();
+    bindings[2].binding = 2;
+    bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[2].descriptorCount = 1;
+    bindings[2].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[2].pImmutableSamplers = &fogSampler;
+    // Last frame's ray traced lighting (RtLighting), read by the terrain,
+    // building, doodad and character surfaces. Immutable samplers again, so
+    // the preview's sets only name the neutral view.
+    const VkSampler rtSampler = rtLighting_->sampler();
+    for (uint32_t b = 3; b <= 4; ++b) {
+        bindings[b].binding = b;
+        bindings[b].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[b].descriptorCount = 1;
+        bindings[b].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        bindings[b].pImmutableSamplers = &rtSampler;
+    }
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 2;
+    layoutInfo.bindingCount = 5;
     layoutInfo.pBindings = bindings;
 
     if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &perFrameSetLayout) != VK_SUCCESS) {
@@ -260,7 +314,7 @@ bool Renderer::createPerFrameResources() {
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     poolSizes[0].descriptorCount = MAX_FRAMES * 2; // normal frames + reflection frames
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = MAX_FRAMES * 2;
+    poolSizes[1].descriptorCount = MAX_FRAMES * 2 * 4;  // shadow, fog, two RT results, per set
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -316,7 +370,20 @@ bool Renderer::createPerFrameResources() {
         shadowImgInfo.imageView = shadowDepthView[i];
         shadowImgInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-        VkWriteDescriptorSet writes[2]{};
+        // Neutral until the fog is switched on; writeFogVolumeBindings swaps
+        // in this slot's own volume then.
+        VkDescriptorImageInfo fogImgInfo{};
+        fogImgInfo.imageView = volumetricFog_->getVolumeView(i);
+        fogImgInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        // Neutral until the ray traced lighting is on; writeRtLightingBindings
+        // swaps in the other slot's results then.
+        VkDescriptorImageInfo rtImgInfo[2]{};
+        rtImgInfo[0].imageView = rtLighting_->lightViewForSlot(i);
+        rtImgInfo[1].imageView = rtLighting_->giViewForSlot(i);
+        rtImgInfo[0].imageLayout = rtImgInfo[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkWriteDescriptorSet writes[5]{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet = perFrameDescSets[i];
         writes[0].dstBinding = 0;
@@ -329,8 +396,22 @@ bool Renderer::createPerFrameResources() {
         writes[1].descriptorCount = 1;
         writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         writes[1].pImageInfo = &shadowImgInfo;
+        writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[2].dstSet = perFrameDescSets[i];
+        writes[2].dstBinding = 2;
+        writes[2].descriptorCount = 1;
+        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[2].pImageInfo = &fogImgInfo;
+        for (uint32_t b = 0; b < 2; ++b) {
+            writes[3 + b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[3 + b].dstSet = perFrameDescSets[i];
+            writes[3 + b].dstBinding = 3 + b;
+            writes[3 + b].descriptorCount = 1;
+            writes[3 + b].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[3 + b].pImageInfo = &rtImgInfo[b];
+        }
 
-        vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+        vkUpdateDescriptorSets(device, 5, writes, 0, nullptr);
     }
 
     // --- Create reflection per-frame UBO and descriptor set ---
@@ -378,7 +459,20 @@ bool Renderer::createPerFrameResources() {
             shadowImgInfo.imageView = shadowDepthView[i];
             shadowImgInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-            VkWriteDescriptorSet writes[2]{};
+            // Always neutral: the volume is built for the camera, and the
+            // mirrored one would read it at the wrong place. The reflection's
+            // block switches the fog off.
+            VkDescriptorImageInfo fogImgInfo{};
+            fogImgInfo.imageView = volumetricFog_->getNeutralView();
+            fogImgInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            // Neutral as well: the result is the camera's, and the block's
+            // switch is off in the reflection's copy.
+            VkDescriptorImageInfo rtImgInfo{};
+            rtImgInfo.imageView = rtLighting_->neutralView();
+            rtImgInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkWriteDescriptorSet writes[5]{};
             writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[0].dstSet = reflPerFrameDescSet[i];
             writes[0].dstBinding = 0;
@@ -391,9 +485,29 @@ bool Renderer::createPerFrameResources() {
             writes[1].descriptorCount = 1;
             writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             writes[1].pImageInfo = &shadowImgInfo;
+            writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[2].dstSet = reflPerFrameDescSet[i];
+            writes[2].dstBinding = 2;
+            writes[2].descriptorCount = 1;
+            writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[2].pImageInfo = &fogImgInfo;
+            for (uint32_t b = 3; b <= 4; ++b) {
+                writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[b].dstSet = reflPerFrameDescSet[i];
+                writes[b].dstBinding = b;
+                writes[b].descriptorCount = 1;
+                writes[b].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                writes[b].pImageInfo = &rtImgInfo;
+            }
 
-            vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+            vkUpdateDescriptorSets(device, 5, writes, 0, nullptr);
         }
+    }
+
+    // The compute side. Not fatal: without it the fog simply stays off, and
+    // applyPendingQuality says so when it is asked for.
+    if (!volumetricFog_->createPipelines(perFrameSetLayout, shadowDepthView)) {
+        LOG_WARNING("Volumetric fog pipelines failed to build - volumetric fog unavailable");
     }
 
     LOG_INFO("Per-frame Vulkan resources created (shadow map ", SHADOW_MAP_SIZE, "x", SHADOW_MAP_SIZE, ")");
@@ -413,8 +527,23 @@ void Renderer::destroyPerFrameResources() {
         reflPerFrameUBO = VK_NULL_HANDLE;
         reflPerFrameUBOMapped = nullptr;
     }
+    // Before the layout: its compute pipeline layout was built from it.
+    if (volumetricFog_) {
+        volumetricFog_->shutdown();
+        volumetricFog_.reset();
+    }
     destroy(device, sceneDescriptorPool);
     destroy(device, perFrameSetLayout);
+    // After every renderer has let go of its geometry, which is why this is
+    // here rather than beside the fog: shutdown() calls this last.
+    if (rtLighting_) {
+        rtLighting_->shutdown();
+        rtLighting_.reset();
+    }
+    if (rtScene_) {
+        rtScene_->shutdown();
+        rtScene_.reset();
+    }
 
     // Destroy per-frame shadow resources
     for (uint32_t i = 0; i < MAX_FRAMES; i++) {
@@ -477,6 +606,15 @@ void Renderer::updatePerFrameUBO() {
     currentFrameData.shadowParams = glm::vec4(shadowsEnabled ? 1.0f : 0.0f, shadowBias,
                                               1.0f / static_cast<float>(SHADOW_MAP_SIZE), shadowWorldTexel);
 
+    // Whether this frame builds the fog volume. Decided here, beside the
+    // switch in the block the shaders read, and the frame graph dispatches by
+    // the same flag - so no shader reads a volume its frame did not build.
+    volumetricThisFrame_ = volumetricFog_ && volumetricFog_->isOn() &&
+                           volumetricFogDensity_ > 0.0f &&
+                           !(passAblation_ && passAblation_->skip(AblationPass::VolumetricFog));
+    currentFrameData.volumetricParams = volumetricThisFrame_ ? volumetricFog_->frameParams()
+                                                             : glm::vec4(0.0f);
+
     for (uint32_t i = 0; i < MAX_LOCAL_LIGHTS; ++i) {
         currentFrameData.localLightPosRadius[i] = glm::vec4(0.0f);
         currentFrameData.localLightColorIntensity[i] = glm::vec4(0.0f);
@@ -494,6 +632,13 @@ void Renderer::updatePerFrameUBO() {
             MAX_LOCAL_LIGHTS - localLightCount);
     }
     currentFrameData.localLightMeta = glm::ivec4(static_cast<int32_t>(localLightCount), 0, 0, 0);
+
+    if (rtLighting_) {
+        const RtLighting::ConsumerData rt = rtLighting_->consumerData();
+        currentFrameData.rtViewProj = rt.viewProj;
+        currentFrameData.rtCameraPos = rt.cameraPos;
+        currentFrameData.rtParams = rt.params;
+    }
 
     // What the local lights are actually doing, throttled to a line every few
     // seconds. These are gathered around the camera rather than the player, so
@@ -658,6 +803,7 @@ bool Renderer::initialize(core::Window* win) {
         LOG_WARNING("Charge effect initialization failed (non-fatal)");
 
     levelUpEffect = std::make_unique<LevelUpEffect>();
+    lootSparkles_ = std::make_unique<LootSparkles>();
 
     // Non-fatal like the effects above: a device that cannot build the compute
     // pipeline still gets everything else, and isReady() gates both call sites.
@@ -714,6 +860,23 @@ bool Renderer::initialize(core::Window* win) {
     // Create PostProcessPipeline (§4.3 - owns FSR/FXAA/FSR2/FSR3/brightness)
     postProcessPipeline_ = std::make_unique<PostProcessPipeline>();
     postProcessPipeline_->initialize(vkCtx);
+    // The ray traced lighting normally records where the water leaves the
+    // scene pass. A multisampled scene in an off-screen target never leaves
+    // it early, so the pass records here instead, as the upscaler takes over.
+    postProcessPipeline_->setSceneClosedHook([this](VkCommandBuffer) {
+        if (rtRecordedThisFrame_ || !postProcessPipeline_) return;
+        recordRtLighting(postProcessPipeline_->getSceneDepthImage(),
+                         postProcessPipeline_->getSceneRenderExtent(),
+                         postProcessPipeline_->sceneDepthIsMsaa());
+    });
+
+    // Not fatal: without them the picture is only missing its rays.
+    sunShafts_ = std::make_unique<SunShafts>();
+    if (!sunShafts_->initialize(vkCtx)) {
+        LOG_WARNING("Sun shafts failed to initialise - sun shafts unavailable");
+        sunShafts_->shutdown();
+        sunShafts_.reset();
+    }
 
     // Create render graph and register virtual resources
     renderGraph_ = std::make_unique<RenderGraph>();
@@ -721,6 +884,7 @@ bool Renderer::initialize(core::Window* win) {
     // Create overlay system (selection circle + fullscreen overlay)
     overlaySystem_ = std::make_unique<OverlaySystem>(vkCtx);
     renderGraph_->registerResource("shadow_depth");
+    renderGraph_->registerResource("volumetric_fog");
     renderGraph_->registerResource("reflection_texture");
     renderGraph_->registerResource("scene_color");
     renderGraph_->registerResource("scene_depth");
@@ -731,6 +895,10 @@ bool Renderer::initialize(core::Window* win) {
 }
 
 void Renderer::shutdown() {
+    // A recording in progress is finished, not abandoned: the file is only
+    // playable once its index is written.
+    if (recorder_) stopRecording();
+
     destroySecondaryCommandResources();
 
     LOG_DEBUG("Renderer::shutdown - terrainManager stopWorkers...");
@@ -762,6 +930,11 @@ void Renderer::shutdown() {
     if (worldMap) {
         worldMap->shutdown();
         worldMap.reset();
+    }
+
+    if (sunShafts_) {
+        sunShafts_->shutdown();
+        sunShafts_.reset();
     }
 
     LOG_DEBUG("Renderer::shutdown - skySystem...");
@@ -842,8 +1015,8 @@ void Renderer::shutdown() {
     if (skyboxModelRenderer_) {
         skyboxModelRenderer_->shutdown();
         skyboxModelRenderer_.reset();
-        skyboxModelInstanceId_ = 0;
-        skyboxModelPath_.clear();
+        skyLayers_.clear();
+        loadedSkyModels_.clear();
     }
 
     // Audio shutdown is handled by AudioCoordinator (owned by Application).
@@ -1062,6 +1235,8 @@ void Renderer::beginFrame() {
         }
     }
 
+    worldDrawnThisFrame_ = false;
+
     // Apply deferred MSAA change between frames (before any rendering state is used)
     if (msaaChangePending_) {
         applyMsaaChange();
@@ -1072,6 +1247,10 @@ void Renderer::beginFrame() {
         // driver answers by losing the device.
         if (vkCtx) vkCtx->resetFrameSyncState();
     }
+
+    // A fog quality change builds or frees its volumes, which the per-frame
+    // sets bind - so between frames, before this one's set is used.
+    if (volumetricFog_ && volumetricFog_->applyPendingQuality()) writeFogVolumeBindings();
 
     // Retire finished upload batches every frame.
     //
@@ -1119,12 +1298,22 @@ void Renderer::beginFrame() {
         }
     }
 
+    // Between frames, so a resize of the ray traced lighting's images can wait
+    // for the device and rewrite both slots' sets.
+    if (rtLighting_ && rtLighting_->prepare(sceneRenderExtent())) writeRtLightingBindings();
+
+    rtRecordedThisFrame_ = false;
+
     // Acquire swapchain image and begin command buffer
     currentCmd = vkCtx->beginFrame(currentImageIndex);
     if (currentCmd == VK_NULL_HANDLE) {
         // Swapchain out of date, will retry next frame
         return;
     }
+
+    // This slot's fence has just been waited on, so a frame it copied for the
+    // recording two frames ago is complete.
+    collectRecordedFrame();
 
     // FSR2 jitter pattern (§4.3 - delegates to PostProcessPipeline)
     if (postProcessPipeline_ && camera) postProcessPipeline_->applyJitter(camera.get());
@@ -1263,6 +1452,10 @@ void Renderer::endFrame() {
             vkCtx->getCurrentFrame());
     }
 
+    // The picture is finished and out of every pass that drew it: the one
+    // point where the shafts can copy it down, before the overlay pass opens.
+    recordSunShafts();
+
     const auto& overlayFbs = vkCtx->getOverlayFramebuffers();
     if (vkCtx->getOverlayRenderPass() != VK_NULL_HANDLE && currentImageIndex < overlayFbs.size()) {
         VkRenderPassBeginInfo overlayRp{};
@@ -1282,6 +1475,9 @@ void Renderer::endFrame() {
         sc.extent = ext;
         vkCmdSetScissor(currentCmd, 0, 1, &sc);
 
+        // Under the interface, over everything else.
+        if (sunShafts_) sunShafts_->composite(currentCmd, vkCtx->getCurrentFrame());
+
         // ImGui's pipelines are built against the overlay pass, so it always
         // records inline here rather than into a scene-pass secondary buffer.
         ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), currentCmd);
@@ -1292,6 +1488,12 @@ void Renderer::endFrame() {
     }
 
     // Water now renders in the main pass (renderWorld), no separate 1x pass needed.
+
+    if (afterInterface_) afterInterface_(currentCmd);
+
+    // Last, so the recording holds everything the player sees - and then the
+    // recording dot, which it does not.
+    recordScreenCapture();
 
     // Submit and present
     vkCtx->endFrame(currentCmd, currentImageIndex);
@@ -1304,6 +1506,110 @@ void Renderer::setCharacterFollow(uint32_t instanceId) {
         cameraController->setFollowTarget(&characterPosition);
     }
     if (animationController_) animationController_->onCharacterFollow(instanceId);
+}
+
+bool Renderer::startRecording(const std::string& path, std::string& error) {
+    if (recorder_ && recorder_->isRecording()) {
+        error = "already recording";
+        return false;
+    }
+    if (!vkCtx) {
+        error = "there is no renderer to record from";
+        return false;
+    }
+    if (!core::ScreenRecorder::compiledIn()) {
+        error = "this build was made without FFmpeg 5.1 or later, which recording needs";
+        return false;
+    }
+    const VkExtent2D extent = vkCtx->getSwapchainExtent();
+    const core::RecordingSize size = core::recordingFrameSize(extent.width, extent.height);
+    auto capture = std::make_unique<ScreenCapture>();
+    if (!capture->initialize(vkCtx, size.width, size.height)) {
+        capture->shutdown();
+        error = "could not set up reading frames back from the GPU";
+        return false;
+    }
+    auto recorder = std::make_unique<core::ScreenRecorder>();
+    if (!recorder->start(path, size, error)) {
+        capture->shutdown();
+        return false;
+    }
+    screenCapture_ = std::move(capture);
+    recorder_ = std::move(recorder);
+    recordingFailure_.clear();
+    return true;
+}
+
+core::ScreenRecorder::Stats Renderer::stopRecording() {
+    core::ScreenRecorder::Stats stats;
+    if (!recorder_) return stats;
+    // The frames still on the GPU are finished and handed over, oldest first,
+    // so the file ends where the recording did rather than two frames short.
+    if (vkCtx && screenCapture_) {
+        vkDeviceWaitIdle(vkCtx->getDevice());
+        ScreenCapture::Ready ready[2] = {screenCapture_->collect(0), screenCapture_->collect(1)};
+        if (ready[0].valid && ready[1].valid && ready[1].pts < ready[0].pts) std::swap(ready[0], ready[1]);
+        ScreenCapture* capture = screenCapture_.get();
+        for (const auto& r : ready) {
+            if (!r.valid) continue;
+            const uint32_t buffer = r.buffer;
+            recorder_->submit({.bgra = r.bgra, .stride = r.stride, .pts = r.pts,
+                               .release = [capture, buffer] { capture->release(buffer); }});
+        }
+    }
+    // The recorder first: its thread holds readback buffers until it is done.
+    stats = recorder_->stop();
+    recorder_.reset();
+    if (screenCapture_) {
+        screenCapture_->shutdown();
+        screenCapture_.reset();
+    }
+    return stats;
+}
+
+bool Renderer::isRecording() const {
+    return recorder_ && recorder_->isRecording();
+}
+
+std::string Renderer::takeRecordingFailure() {
+    std::string failure;
+    failure.swap(recordingFailure_);
+    return failure;
+}
+
+void Renderer::collectRecordedFrame() {
+    if (!recorder_ || !screenCapture_ || !vkCtx) return;
+    const ScreenCapture::Ready ready = screenCapture_->collect(vkCtx->getCurrentFrame());
+    if (ready.valid) {
+        ScreenCapture* capture = screenCapture_.get();
+        const uint32_t buffer = ready.buffer;
+        recorder_->submit({.bgra = ready.bgra, .stride = ready.stride, .pts = ready.pts,
+                           .release = [capture, buffer] { capture->release(buffer); }});
+    }
+    // Given up on its own: finish what it has and say why, once.
+    if (recorder_->failed()) {
+        recordingFailure_ = recorder_->failure();
+        stopRecording();
+    }
+}
+
+void Renderer::recordScreenCapture() {
+    if (!recorder_ || !screenCapture_ || !recorder_->isRecording() || currentCmd == VK_NULL_HANDLE) return;
+    const auto& images = vkCtx->getSwapchainImages();
+    const VkExtent2D extent = vkCtx->getSwapchainExtent();
+    int64_t pts = 0;
+    if (currentImageIndex < images.size() && recorder_->frameDue(&pts)) {
+        if (!screenCapture_->record(currentCmd, vkCtx->getCurrentFrame(), images[currentImageIndex],
+                                    extent, pts)) {
+            recorder_->frameDropped();
+        }
+        recorder_->frameTaken(pts);
+    }
+    const auto& overlayFbs = vkCtx->getOverlayFramebuffers();
+    if (vkCtx->getOverlayRenderPass() != VK_NULL_HANDLE && currentImageIndex < overlayFbs.size()) {
+        screenCapture_->drawIndicator(currentCmd, overlayFbs[currentImageIndex], extent,
+                                      static_cast<float>(recorder_->elapsedSeconds()));
+    }
 }
 
 bool Renderer::captureScreenshot(const std::string& outputPath) {
@@ -1418,47 +1724,58 @@ const std::string& Renderer::getCurrentZoneName() const {
     return audioCoordinator_ ? audioCoordinator_->getCurrentZoneName() : empty;
 }
 
-bool Renderer::ensureSkyboxModel() {
-    // Which skybox model a place uses is Light.dbc's answer, not a map id:
-    // LightParams names a LightSkybox row and LightSkybox names the model, and
-    // getActiveSkyboxPath already walks that for whatever map the player is
-    // on. This was restricted to Outland, so every other zone that defines one
-    // - Tirisfal's night sky among them - fell back to the procedural sky.
-    //
-    // A zone that names no skybox leaves the path empty and is unaffected.
-    // WOWEE_NO_SKY_M2=1 draws the procedural sky alone.
-    //
-    // There are two skies over the player - this client's own gradient dome and
-    // the original client's sky model on top of it - and a report about the sky
-    // cannot say which. Everything measurable about the model is right: the
-    // lighting inputs behind it hold still, its clock advances at wall speed
-    // with no restart, and the frame time beside it is steady. So the next
-    // thing worth knowing is whether taking it away takes the fault with it,
-    // and that is one bit that no amount of reading the code will supply.
+bool Renderer::updateSkyboxLayers() {
+    // Which skybox models a place uses is Light.dbc's answer, not a map id:
+    // LightParams names a LightSkybox row and LightSkybox names the model.
+    // LightingManager walks that for the lights around the player and says
+    // how much of each is up; this keeps one instance per model and fades it
+    // by that weight, so crossing from one zone's sky to another's is a blend
+    // and not a swap. WOWEE_NO_SKY_M2=1 draws the procedural sky alone.
     static const bool noSkyM2 = std::getenv("WOWEE_NO_SKY_M2") != nullptr;
     if (noSkyM2) return false;
-
-    if (!skyboxModelRenderer_ || !lightingManager || !cachedAssetManager ||
-        !camera) {
+    if (!skyboxModelRenderer_ || !lightingManager || !cachedAssetManager || !camera) {
         return false;
     }
 
-    std::string path = lightingManager->getActiveSkyboxPath();
-    if (path.empty()) return false;
-    std::replace(path.begin(), path.end(), '/', '\\');
-    if (path == skyboxModelPath_) return skyboxModelInstanceId_ != 0;
-    if (failedSkyboxPaths_.count(path)) return skyboxModelInstanceId_ != 0;
+    auto normalized = [](std::string p) {
+        std::replace(p.begin(), p.end(), '/', '\\');
+        return p;
+    };
+    const auto& layers = lightingManager->getSkyboxLayers();
 
-    // The sky that is up stays up until the next one is known to be loadable.
-    //
-    // This used to clear the renderer and blank the path before reading a
-    // byte, so any path that did not resolve left no sky at all - and the
-    // instance is dropped and rebuilt on every change, which restarts the
-    // model's animation. While the active path was changing as the player
-    // walked, that was a sky whose clouds kept jumping back to the start and
-    // vanishing in between. The path churn is fixed in LightingManager; this
-    // makes the swap itself atomic, so a failure costs nothing and the old sky
-    // simply stays.
+    // Faded out and no longer wanted.
+    std::erase_if(skyLayers_, [&](const SkyLayerInstance& sky) {
+        const bool wanted = std::any_of(layers.begin(), layers.end(), [&](const auto& l) {
+            return normalized(l.path) == sky.path;
+        });
+        if (!wanted) skyboxModelRenderer_->removeInstance(sky.instanceId);
+        return !wanted;
+    });
+
+    for (const auto& layer : layers) {
+        const std::string path = normalized(layer.path);
+        auto it = std::find_if(skyLayers_.begin(), skyLayers_.end(),
+                               [&](const SkyLayerInstance& s) { return s.path == path; });
+        if (it == skyLayers_.end()) {
+            const uint32_t modelId = loadSkyboxModel(path);
+            if (modelId == 0) continue;
+            const uint32_t instanceId = skyboxModelRenderer_->createInstance(
+                modelId, camera->getPosition(), glm::vec3(0.0f), 1.0f);
+            if (instanceId == 0) continue;
+            skyboxModelRenderer_->setSkipCollision(instanceId, true);
+            skyLayers_.push_back({.path = path, .instanceId = instanceId});
+            it = std::prev(skyLayers_.end());
+        }
+        skyboxModelRenderer_->setInstanceFade(it->instanceId, layer.weight);
+        skyboxModelRenderer_->setInstancePosition(it->instanceId, camera->getPosition());
+    }
+    return !skyLayers_.empty();
+}
+
+uint32_t Renderer::loadSkyboxModel(const std::string& path) {
+    if (auto it = loadedSkyModels_.find(path); it != loadedSkyModels_.end()) return it->second;
+    if (failedSkyboxPaths_.count(path)) return 0;
+
     std::vector<std::string> candidates{path};
     const size_t dot = path.find_last_of('.');
     if (dot == std::string::npos) {
@@ -1480,9 +1797,9 @@ bool Renderer::ensureSkyboxModel() {
         }
     }
     if (modelData.empty()) {
-        LOG_WARNING("Outland original skybox unavailable: ", path);
+        LOG_WARNING("Skybox model unavailable: ", path);
         failedSkyboxPaths_.insert(path);
-        return skyboxModelInstanceId_ != 0;
+        return 0;
     }
 
     pipeline::M2Model model = pipeline::M2Loader::load(modelData);
@@ -1493,31 +1810,20 @@ bool Renderer::ensureSkyboxModel() {
         pipeline::M2Loader::loadSkin(skinData, model);
     }
     if (!model.isValid()) {
-        LOG_WARNING("Outland original skybox model is invalid: ", resolvedPath);
+        LOG_WARNING("Skybox model is invalid: ", resolvedPath);
         failedSkyboxPaths_.insert(path);
-        return skyboxModelInstanceId_ != 0;
+        return 0;
     }
-
-    // The model is good, so the old one can go now.
-    skyboxModelRenderer_->clear();
-    skyboxModelPath_ = path;
-    skyboxModelInstanceId_ = 0;
 
     const uint32_t modelId = static_cast<uint32_t>(std::hash<std::string>{}(model.name));
     if (!skyboxModelRenderer_->loadModel(model, modelId)) {
-        LOG_WARNING("Failed to upload Outland original skybox: ", resolvedPath);
+        LOG_WARNING("Failed to upload skybox model: ", resolvedPath);
         failedSkyboxPaths_.insert(path);
-        return false;
+        return 0;
     }
-    skyboxModelInstanceId_ = skyboxModelRenderer_->createInstance(
-        modelId, camera->getPosition(), glm::vec3(0.0f), 1.0f);
-    if (!skyboxModelInstanceId_) {
-        failedSkyboxPaths_.insert(path);
-        return false;
-    }
-    skyboxModelRenderer_->setSkipCollision(skyboxModelInstanceId_, true);
-    LOG_INFO("Outland original skybox active: ", resolvedPath);
-    return true;
+    loadedSkyModels_[path] = modelId;
+    LOG_INFO("Skybox model loaded: ", resolvedPath);
+    return modelId;
 }
 
 bool Renderer::isOnOutdoorPvpObjective() const {
@@ -1814,8 +2120,7 @@ void Renderer::update(float deltaTime) {
     if (skySystem) {
         skySystem->update(deltaTime);
     }
-    if (ensureSkyboxModel() && skyboxModelRenderer_ && camera) {
-        skyboxModelRenderer_->setInstancePosition(skyboxModelInstanceId_, camera->getPosition());
+    if (updateSkyboxLayers() && skyboxModelRenderer_ && camera) {
         skyboxModelRenderer_->update(deltaTime, camera->getPosition(),
             camera->getProjectionMatrix() * camera->getViewMatrix());
     }
@@ -2567,6 +2872,7 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
     if (skipAll) return;
 
     worldDrawnLastFrame_ = true;
+    worldDrawnThisFrame_ = true;
 
     auto renderStart = std::chrono::steady_clock::now();
     lastTerrainRenderMs = 0.0;
@@ -2609,8 +2915,16 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
     float timeOfDay = lightingManager
         ? lightingManager->getVisualTimeOfDayHours()
         : (skybox ? skybox->getTimeOfDay() : 12.0f);
-    const bool useOriginalSkybox =
-        skyboxModelRenderer_ && skyboxModelInstanceId_ != 0;
+    // Two questions, apart while the sky crossfades. The sky models are drawn
+    // whenever any is up at all; the procedural sun, moons and clouds they
+    // stand in for hand over halfway, where both are at half and a switch is
+    // least visible - rather than staying away until the last model has faded.
+    const bool drawSkyModels = skyboxModelRenderer_ && !skyLayers_.empty();
+    float skyModelCoverage = 0.0f;
+    if (lightingManager) {
+        for (const auto& layer : lightingManager->getSkyboxLayers()) skyModelCoverage += layer.weight;
+    }
+    const bool useOriginalSkybox = drawSkyModels && skyModelCoverage >= 0.5f;
 
     // ── Multithreaded secondary command buffer recording ──
     // Terrain, WMO, and M2 record on worker threads while main thread handles
@@ -2627,7 +2941,7 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
         if (wmoRenderer) wmoRenderer->prepareRender();
         auto prepWmoEnd = std::chrono::steady_clock::now();
         if (m2Renderer && camera) m2Renderer->prepareRender(frameIdx, *camera);
-        if (useOriginalSkybox && camera)
+        if (drawSkyModels && camera)
             skyboxModelRenderer_->prepareRender(frameIdx, *camera);
         auto prepM2End = std::chrono::steady_clock::now();
         if (characterRenderer) characterRenderer->prepareRender(frameIdx);
@@ -2734,7 +3048,7 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
                     useOriginalSkybox);
                 skyParams.sunOcclusion = sunOcclusion_;
                 skySystem->render(cmd, perFrameSet, *camera, skyParams);
-                if (useOriginalSkybox) {
+                if (drawSkyModels) {
                     skyboxModelRenderer_->render(cmd, perFrameSet, *camera);
                 }
             }
@@ -2938,7 +3252,7 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
                 useOriginalSkybox);
             skyParams.sunOcclusion = sunOcclusion_;
             skySystem->render(currentCmd, perFrameSet, *camera, skyParams);
-            if (useOriginalSkybox) {
+            if (drawSkyModels) {
                 skyboxModelRenderer_->prepareRender(frameIdx, *camera);
                 skyboxModelRenderer_->render(currentCmd, perFrameSet, *camera);
             }
@@ -3030,6 +3344,10 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
             sceneColor = vkCtx->getSwapchainImages()[currentImageIndex];
             sceneDepth = vkCtx->getDepthCopySourceImage();
         }
+
+        // The opaque scene is finished and out of its pass: the ray traced
+        // lighting reads its depth here, for the surfaces of the next frame.
+        recordRtLighting(sceneDepth, sceneExtent, depthIsMsaa);
 
         if (sceneColor != VK_NULL_HANDLE && waterRenderer->isRefractionEnabled()) {
             waterRenderer->captureSceneHistory(currentCmd, sceneColor, sceneDepth,
@@ -3339,6 +3657,7 @@ bool Renderer::initializeRenderers(pipeline::AssetManager* assetManager, const s
             terrainRenderer.reset();
             return false;
         }
+        terrainRenderer->setRtScene(rtScene_.get());
         if (shadowRenderPass != VK_NULL_HANDLE) {
             terrainRenderer->initializeShadow(shadowRenderPass);
         }
@@ -3378,6 +3697,7 @@ bool Renderer::initializeRenderers(pipeline::AssetManager* assetManager, const s
         m2Renderer = std::make_unique<M2Renderer>();
         if (!m2Renderer->initialize(vkCtx, perFrameSetLayout, assetManager))
             LOG_ERROR("M2Renderer initialization failed");
+        m2Renderer->setRtScene(rtScene_.get());
         if (swimEffects) {
             swimEffects->setM2Renderer(m2Renderer.get());
         }
@@ -3414,6 +3734,7 @@ bool Renderer::initializeRenderers(pipeline::AssetManager* assetManager, const s
         wmoRenderer = std::make_unique<WMORenderer>();
         if (!wmoRenderer->initialize(vkCtx, perFrameSetLayout, assetManager))
             LOG_ERROR("WMORenderer initialization failed");
+        wmoRenderer->setRtScene(rtScene_.get());
         if (shadowRenderPass != VK_NULL_HANDLE) {
             if (!wmoRenderer->initializeShadow(shadowRenderPass))
                 LOG_WARNING("WMO shadow pipeline initialization failed");
@@ -4033,6 +4354,9 @@ void Renderer::renderReflectionPass() {
     glm::vec3 reflPos = camPos;
     reflPos.z = 2.0f * waterHeight - reflPos.z;
     reflData.viewPos = glm::vec4(reflPos, 1.0f);
+    // The fog volume is the camera's; its sets here bind the neutral one.
+    reflData.volumetricParams = glm::vec4(0.0f);
+    reflData.rtParams = glm::vec4(0.0f);
     std::memcpy(reflPerFrameUBOMapped, &reflData, sizeof(GPUPerFrameData));
 
     // Begin reflection render pass (clears to black; scene rendered if pipeline-compatible)
@@ -4111,8 +4435,9 @@ void Renderer::renderShadowPass() {
                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     b1.image = shadowDepthImage[frame];
     b1.subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1};
+    // The fog's compute pass reads the map as well as the fragment shaders.
     VkPipelineStageFlags srcStage = (shadowDepthLayout_[frame] == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-        ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+        ? (VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
         : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
     b1.srcStageMask = srcStage;
     VkDependencyInfo b1Dep{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
@@ -4121,17 +4446,53 @@ void Renderer::renderShadowPass() {
     b1Dep.pImageMemoryBarriers = &b1;
     cmdPipelineBarrier2(currentCmd, b1Dep);
 
-    // Begin shadow render pass
-    VkRenderPassBeginInfo rpInfo{};
-    rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rpInfo.renderPass = shadowRenderPass;
-    rpInfo.framebuffer = shadowFramebuffer[frame];
-    rpInfo.renderArea = {.offset = {.x = 0, .y = 0}, .extent = {.width = SHADOW_MAP_SIZE, .height = SHADOW_MAP_SIZE}};
-    VkClearValue clear{};
-    clear.depthStencil = {.depth = 1.0f, .stencil = 0};
-    rpInfo.clearValueCount = 1;
-    rpInfo.pClearValues = &clear;
-    vkCmdBeginRenderPass(currentCmd, &rpInfo, VK_SUBPASS_CONTENTS_INLINE);
+    // Begin the shadow pass, one way or the other.
+    //
+    // The first pass converted to dynamic rendering, and the one with least
+    // to lose by it: one attachment, no colour, no resolve, a single
+    // begin/end, and pipelines nothing else shares. Its render pass declared
+    // an EXTERNAL->0 dependency covering the same fragment-read to
+    // depth-write hazard that barrier 1 above already covers explicitly, so
+    // nothing is lost by dropping the implicit half - the layout it wants is
+    // the layout b1 leaves it in.
+    const bool dynamicRendering = vkCtx->useDynamicRendering();
+    // Said once, at warning level, because a bug report arrives with a
+    // warnings-only log and "are the shadows drawn the new way" is the first
+    // question this change makes anyone ask. A line here answers it without
+    // a second run.
+    static bool saidWhichPath = false;
+    if (!saidWhichPath) {
+        saidWhichPath = true;
+        LOG_WARNING("Shadow pass records with ",
+                    dynamicRendering ? "vkCmdBeginRendering" : "a VkRenderPass");
+    }
+    if (dynamicRendering) {
+        VkRenderingAttachmentInfo depthAttach{};
+        depthAttach.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        depthAttach.imageView = shadowDepthView[frame];
+        depthAttach.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depthAttach.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        depthAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        depthAttach.clearValue.depthStencil = {.depth = 1.0f, .stencil = 0};
+
+        VkRenderingInfo renderInfo{};
+        renderInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        renderInfo.renderArea = {.offset = {.x = 0, .y = 0}, .extent = {.width = SHADOW_MAP_SIZE, .height = SHADOW_MAP_SIZE}};
+        renderInfo.layerCount = 1;
+        renderInfo.pDepthAttachment = &depthAttach;
+        vkCmdBeginRendering(currentCmd, &renderInfo);
+    } else {
+        VkRenderPassBeginInfo rpInfo{};
+        rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        rpInfo.renderPass = shadowRenderPass;
+        rpInfo.framebuffer = shadowFramebuffer[frame];
+        rpInfo.renderArea = {.offset = {.x = 0, .y = 0}, .extent = {.width = SHADOW_MAP_SIZE, .height = SHADOW_MAP_SIZE}};
+        VkClearValue clear{};
+        clear.depthStencil = {.depth = 1.0f, .stencil = 0};
+        rpInfo.clearValueCount = 1;
+        rpInfo.pClearValues = &clear;
+        vkCmdBeginRenderPass(currentCmd, &rpInfo, VK_SUBPASS_CONTENTS_INLINE);
+    }
 
     VkViewport vp{.x = 0, .y = 0, .width = static_cast<float>(SHADOW_MAP_SIZE), .height = static_cast<float>(SHADOW_MAP_SIZE), .minDepth = 0.0f, .maxDepth = 1.0f};
     vkCmdSetViewport(currentCmd, 0, 1, &vp);
@@ -4157,13 +4518,18 @@ void Renderer::renderShadowPass() {
     }
     }  // drawCasters
 
-    vkCmdEndRenderPass(currentCmd);
+    if (dynamicRendering) {
+        vkCmdEndRendering(currentCmd);
+    } else {
+        vkCmdEndRenderPass(currentCmd);
+    }
 
     // Barrier 2: DEPTH_STENCIL_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL
     VkImageMemoryBarrier2 b2{};
     b2.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
     b2.srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-    b2.dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    // Compute too: the volumetric fog samples it right after this pass.
+    b2.dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
     b2.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     b2.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     b2.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -4179,6 +4545,230 @@ void Renderer::renderShadowPass() {
     cmdPipelineBarrier2(currentCmd, b2Dep);
     shadowDepthLayout_[frame] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     if (vkCtx) vkCtx->gpuMark(currentCmd, "shadows");
+}
+
+VkImageView Renderer::getNeutralRtLightingView() const {
+    return rtLighting_ ? rtLighting_->neutralView() : VK_NULL_HANDLE;
+}
+
+void Renderer::setRtLightingMode(int mode) {
+    if (!rtLighting_) return;
+    rtLighting_->setMode(static_cast<RtLighting::Mode>(std::clamp(mode, 0, 3)));
+}
+
+void Renderer::writeRtLightingBindings() {
+    if (!rtLighting_ || !vkCtx) return;
+    // RtLighting::prepare has waited for the device whenever it reports a
+    // change, so neither slot's set is in use.
+    for (uint32_t i = 0; i < MAX_FRAMES; i++) {
+        VkDescriptorImageInfo info[2]{};
+        info[0].imageView = rtLighting_->lightViewForSlot(i);
+        info[1].imageView = rtLighting_->giViewForSlot(i);
+        info[0].imageLayout = info[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkWriteDescriptorSet writes[2]{};
+        for (uint32_t b = 0; b < 2; ++b) {
+            writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[b].dstSet = perFrameDescSets[i];
+            writes[b].dstBinding = 3 + b;
+            writes[b].descriptorCount = 1;
+            writes[b].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[b].pImageInfo = &info[b];
+        }
+        vkUpdateDescriptorSets(vkCtx->getDevice(), 2, writes, 0, nullptr);
+    }
+}
+
+VkExtent2D Renderer::sceneRenderExtent() const {
+    if (postProcessPipeline_ && postProcessPipeline_->getSceneFramebuffer() != VK_NULL_HANDLE) {
+        return postProcessPipeline_->getSceneRenderExtent();
+    }
+    return vkCtx->getSwapchainExtent();
+}
+
+void Renderer::recordRtLighting(VkImage sceneDepth, VkExtent2D sceneExtent, bool depthIsMsaa) {
+    if (!rtLighting_ || !rtLighting_->active() || !camera) return;
+    rtRecordedThisFrame_ = true;
+    RtLighting::FrameInputs in{};
+    in.viewProj = camera->getProjectionMatrix() * camera->getViewMatrix();
+    in.cameraPos = camera->getPosition();
+    in.sunDir = -glm::vec3(currentFrameData.lightDir);
+    in.sunColor = glm::vec3(currentFrameData.lightColor);
+    in.skyColor = glm::vec3(currentFrameData.ambientColor);
+    in.sunUp = in.sunDir.z > -0.05f;
+    if (wmoRenderer) wmoRenderer->syncRtScene();
+    if (m2Renderer) m2Renderer->syncRtScene();
+    rtLighting_->record(currentCmd, sceneDepth, sceneExtent, depthIsMsaa, in);
+    vkCtx->gpuMark(currentCmd, "rt_lighting");
+}
+
+VkImageView Renderer::getNeutralFogVolumeView() const {
+    return volumetricFog_ ? volumetricFog_->getNeutralView() : VK_NULL_HANDLE;
+}
+
+void Renderer::setVolumetricFogQuality(int quality) {
+    if (!volumetricFog_) return;
+    volumetricFog_->setQuality(static_cast<VolumetricFog::Quality>(std::clamp(quality, 0, 3)));
+}
+
+void Renderer::writeFogVolumeBindings() {
+    if (!volumetricFog_ || !vkCtx) return;
+    // applyPendingQuality has already waited for the device, so neither
+    // slot's set is in use by a frame still in flight.
+    for (uint32_t i = 0; i < MAX_FRAMES; i++) {
+        VkDescriptorImageInfo fogImgInfo{};
+        fogImgInfo.imageView = volumetricFog_->getVolumeView(i);
+        fogImgInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = perFrameDescSets[i];
+        write.dstBinding = 2;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &fogImgInfo;
+        vkUpdateDescriptorSets(vkCtx->getDevice(), 1, &write, 0, nullptr);
+    }
+}
+
+float Renderer::volumetricFogExtinction() const {
+    // Per yard, at and below the layer, near the camera. At this a sixth of
+    // the light is gone over the first hundred yards and two fifths across
+    // the whole volume, which thins its air out by 400 - a haze, not a wall,
+    // before the slider scales it - while a ten-yard shaft near the sun still
+    // lifts what is behind it by a tenth or more.
+    constexpr float kBaseExtinction = 0.002f;
+    float extinction = kBaseExtinction * volumetricFogDensity_;
+
+    if (lightingManager) {
+        const auto& lp = lightingManager->getLightingParams();
+        // The zone's own opinion, read off how close its authored fog comes
+        // in: Duskwood's ends at 525 yards and gets most of the mist, an
+        // open plain's ends far out and gets less. The player's fog slider
+        // divides those distances, so it is multiplied back out to reach the
+        // zone's number rather than the slider's.
+        const float strength = lightingManager->getFogStrength();
+        if (strength > 0.001f && lp.fogEnd > 1.0f) {
+            const float authoredEnd = lp.fogEnd * strength;
+            extinction *= glm::clamp(900.0f / authoredEnd, 0.6f, 2.0f);
+        }
+        // Morning mist: thickest around half past six, gone by nine.
+        const float hours = lightingManager->getVisualTimeOfDayHours();
+        const float dawn = 1.0f - glm::smoothstep(0.0f, 2.5f, std::abs(hours - 6.5f));
+        extinction *= 1.0f + 0.8f * dawn;
+    }
+
+    if (weather) {
+        const float w = glm::clamp(weather->getIntensity(), 0.0f, 1.0f);
+        switch (weather->getWeatherType()) {
+            case Weather::Type::RAIN:  extinction *= 1.0f + 1.2f * w; break;
+            case Weather::Type::SNOW:  extinction *= 1.0f + 0.8f * w; break;
+            case Weather::Type::STORM: extinction *= 1.0f + 2.0f * w; break;
+            default: break;
+        }
+    }
+
+    // Indoors the outdoor air mostly stays outside. Not all of it: a hall
+    // with torches in it should still show their glow.
+    if (cameraController && cameraController->isInsideInteriorWMO()) extinction *= 0.35f;
+    return extinction;
+}
+
+void Renderer::renderVolumetricFog() {
+    ZoneScopedN("Renderer::renderVolumetricFog");
+    if (!volumetricThisFrame_ || !volumetricFog_ || !camera || currentCmd == VK_NULL_HANDLE) return;
+    const uint32_t frame = vkCtx->getCurrentFrame();
+    // The inject pass samples this slot's shadow map, so not before the shadow
+    // pass has left it readable: at the login screen, before the player has a
+    // position, it has never been drawn and is still UNDEFINED, which the
+    // validation layer reports for any dispatch that binds it. Skipping leaves
+    // this slot's volume as it was - clear air, until the first real frame -
+    // and the shaders read that.
+    if (shadowDepthLayout_[frame] != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) return;
+    const float dt = std::max(lastDeltaTime_, 0.0f);
+
+    // The ground the mist lies on: the terrain under the player, or the
+    // player's own feet where those are lower - a cave, a city under a
+    // mountain - so the layer is never a ceiling over them. Chased over a
+    // second or two so a step off a ledge does not lift the whole bank of
+    // mist with it; a teleport snaps it, and drops last frame's air too.
+    float ground = characterPosition.z;
+    if (terrainManager) {
+        if (auto h = terrainManager->getHeightAt(characterPosition.x, characterPosition.y)) {
+            ground = std::min(ground, *h);
+        }
+    }
+    if (!fogLayerBaseValid_ || std::abs(ground - fogLayerBase_) > 150.0f) {
+        fogLayerBase_ = ground;
+        fogLayerBaseValid_ = true;
+        volumetricFog_->resetHistory();
+    } else {
+        fogLayerBase_ += (ground - fogLayerBase_) * (1.0f - std::exp(-dt / 1.5f));
+    }
+
+    const float target = volumetricFogExtinction();
+    if (fogExtinction_ < 0.0f) fogExtinction_ = target;
+    fogExtinction_ += (target - fogExtinction_) * (1.0f - std::exp(-dt / 1.0f));
+
+    VolumetricFog::FrameInputs in;
+    in.view = currentFrameData.view;
+    in.projection = currentFrameData.projection;
+    in.cameraPos = glm::vec3(currentFrameData.viewPos);
+    in.time = globalTime;
+    in.density = fogExtinction_;
+    in.layerBase = fogLayerBase_;
+    volumetricFog_->record(currentCmd, frame, perFrameDescSets[frame], in);
+    if (vkCtx) vkCtx->gpuMark(currentCmd, "volumetric fog");
+
+    // What it was built from, every few seconds, for the report that says the
+    // fog is too thick or missing: INFO, so it costs nothing unless asked for.
+    static double lastFogLog = 0.0;
+    if (globalTime - lastFogLog > 5.0) {
+        lastFogLog = globalTime;
+        LOG_INFO("volumetricFog: extinction=", fogExtinction_, "/yd (target ", target,
+                 ") layerBase=", fogLayerBase_, " lights=", currentFrameData.localLightMeta.x);
+    }
+}
+
+void Renderer::recordSunShafts() {
+    if (!sunShafts_ || currentCmd == VK_NULL_HANDLE) return;
+    SunShafts::FrameInputs in;
+    const auto& images = vkCtx->getSwapchainImages();
+    if (sunShaftsEnabled_ && worldDrawnThisFrame_ && camera && lightingManager &&
+        currentImageIndex < images.size() &&
+        !(passAblation_ && passAblation_->skip(AblationPass::SunShafts))) {
+        const auto& lp = lightingManager->getLightingParams();
+        // The sun the lens flare draws around, from the same rule.
+        const glm::vec3 sunDir = sunDirectionFromLightDir(lp.directionalDir);
+        const SunOnScreen sun = sunScreenPosition(camera->getViewMatrix(),
+                                                  camera->getProjectionMatrix(), sunDir);
+        if (sun.inFront) {
+            // Screen strength: 1 would be the sky's own colour over anything a
+            // fully lit walk crosses. Less, because the sky around the sun is
+            // already the brightest thing on screen.
+            float strength = 0.8f;
+            // Up out of the horizon and gone again as it sets. A sun under the
+            // ground lights nothing to stream from.
+            strength *= glm::smoothstep(-0.02f, 0.1f, sunDir.z);
+            // In view, or streaming in from just past an edge, fading out as
+            // it goes half a screen beyond one.
+            const glm::vec2 past = glm::max(glm::abs(sun.uv - 0.5f) - 0.5f, glm::vec2(0.0f));
+            strength *= 1.0f - glm::smoothstep(0.0f, 0.5f, std::max(past.x, past.y));
+            // Rain and snow put a lid over it.
+            if (weather) strength *= 1.0f - 0.8f * glm::clamp(weather->getIntensity(), 0.0f, 1.0f);
+
+            // The sun's own colour, kept in hue and not in brightness, and
+            // half white: the rays should warm at dusk, not turn orange.
+            const glm::vec3 c = lp.diffuseColor;
+            const float peak = std::max({c.r, c.g, c.b, 1e-3f});
+            in.tint = glm::mix(glm::vec3(1.0f), c / peak, 0.5f);
+            in.sunUV = sun.uv;
+            in.strength = strength;
+        }
+    }
+    // Called every frame, strength zero included, so the composite knows
+    // there is nothing of this frame's to add.
+    sunShafts_->record(currentCmd, vkCtx->getCurrentFrame(),
+                       currentImageIndex < images.size() ? images[currentImageIndex] : VK_NULL_HANDLE,
+                       vkCtx->getSwapchainExtent(), in);
 }
 
 // Build the per-frame render graph for off-screen pre-passes.
@@ -4240,6 +4830,15 @@ void Renderer::buildFrameGraph(game::GameHandler* gameHandler) {
     // already declines to draw anything; what has to keep happening is the
     // transition.
     renderGraph_->setPassEnabled("shadow_pass", shadowDepthImage[0] != VK_NULL_HANDLE);
+
+    // Volumetric fog → reads this frame's shadow map, outputs the fog volume
+    // every world shader samples.
+    auto fogVolume = renderGraph_->findResource("volumetric_fog");
+    renderGraph_->addPass("volumetric_fog", {shadowDepth}, {fogVolume},
+        [this](VkCommandBuffer) {
+            renderVolumetricFog();
+        });
+    renderGraph_->setPassEnabled("volumetric_fog", volumetricThisFrame_);
 
     // Reflection pre-pass → outputs reflection_texture (reads scene, so after shadow)
     renderGraph_->addPass("reflection_pass", {shadowDepth}, {reflTex},

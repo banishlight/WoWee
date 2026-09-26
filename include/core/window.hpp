@@ -2,7 +2,7 @@
 
 #include <string>
 #include <memory>
-#include <SDL2/SDL.h>
+#include <SDL3/SDL.h>
 #include <vulkan/vulkan.h>
 #ifdef __EMSCRIPTEN__
 #include "platform/web_frame.hpp"

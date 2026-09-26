@@ -36,6 +36,7 @@ class Camera;
 class VkContext;
 class VkTexture;
 class HiZSystem;
+class RtScene;
 
 // Ceiling on the bone matrices computed and uploaded for one M2 instance.
 // WoW models run well past a hundred bones - the largest shipped model has
@@ -171,6 +172,7 @@ struct M2ModelGPU {
     std::vector<pipeline::M2Sequence> sequences;
     std::vector<uint32_t> globalSequenceDurations;  // Loop durations for global sequence tracks
     bool hasAnimation = false;  // True if any bone has keyframes
+    uint32_t rtMesh = ~0u;      // RtScene mesh, or ~0u when it does not cast
     bool isSmoke = false;       // True for smoke models (UV scroll animation)
     bool isSpellEffect = false;  // True for spell effect models (skip particle dampeners)
     bool isInstancePortal = false; // Instance portal model (spin + glow)
@@ -247,6 +249,9 @@ struct M2Instance {
     float scale;
     glm::mat4 modelMatrix;
     glm::mat4 invModelMatrix;
+    // Its RtScene instance and the matrix last given to it; see syncRtScene.
+    uint32_t rtInstance = ~0u;
+    glm::mat4 rtMatrix{0.0f};
     glm::vec3 worldBoundsMin;
     glm::vec3 worldBoundsMax;
 
@@ -277,6 +282,10 @@ struct M2Instance {
     /// - so the press is the only thing that can say the click landed on this
     /// one and not the scenery beside it.
     float highlight = 0.0f;
+    /// An alpha its owner sets on the whole model - the sky's crossfade
+    /// between zones. Below one the instance is drawn in the blended pass
+    /// alone, every layer of it, since an opaque layer cannot fade otherwise.
+    float fade = 1.0f;
 
     // Particle emitter state
     std::vector<float> emitterAccumulators;  // fractional particle counter per emitter
@@ -467,6 +476,14 @@ public:
 
     /** Set the HiZ system for occlusion culling (Phase 6.3). nullptr disables HiZ. */
     void setHiZSystem(HiZSystem* hiz) { hizSystem_ = hiz; }
+
+    /// Where loaded models register their geometry for the ray traced
+    /// lighting. Static doodads only - animated models would cast their
+    /// bind pose. Not given to the sky's renderer.
+    void setRtScene(RtScene* scene) { rtScene_ = scene; }
+    /// Bring the scene's instances in line with this renderer's, once a frame
+    /// while the lighting is on.
+    void syncRtScene();
     void setForceNoCull(bool v) { forceNoCull_ = v; }
 
     /** Ensure GPU→CPU cull output is visible to the host after a fence wait.
@@ -506,6 +523,12 @@ public:
 
     void setInstanceTransform(uint32_t instanceId, const glm::mat4& transform);
     void setInstanceAnimationFrozen(uint32_t instanceId, bool frozen);
+    /// Play from the first frame, with bones to match.
+    ///
+    /// New instances start at a random point so placed doodads don't animate
+    /// in lockstep, and take their first bones from a sibling that is already
+    /// mid-animation. A spell cast has to start at its beginning instead.
+    void restartInstanceAnimation(uint32_t instanceId);
     /// Play an animation once and stay on its last frame.
     ///
     /// skipToEnd puts the model there immediately, which is what a door that
@@ -516,6 +539,8 @@ public:
 
     /// Light an instance while it is being pressed on. 0 clears it.
     void setInstanceHighlight(uint32_t instanceId, float amount);
+    /// See M2Instance::fade.
+    void setInstanceFade(uint32_t instanceId, float alpha);
     /// Take the light off whatever has it, whichever instance that was.
     void clearInstanceHighlights();
     /// Set the animation sequence by animation ID (e.g. anim::OPEN, anim::CLOSE).
@@ -861,6 +886,16 @@ private:
 
     // HiZ occlusion culling (Phase 6.3) - optional, driven by Renderer
     HiZSystem* hizSystem_ = nullptr;
+
+    RtScene* rtScene_ = nullptr;
+    // RtScene instances this renderer owns, and per RtScene instance id the
+    // sync generation that last saw it and the mesh it places.
+    std::vector<uint32_t> rtOwned_;
+    std::vector<uint64_t> rtSeen_;
+    std::vector<uint32_t> rtMeshOf_;
+    uint64_t rtSyncGeneration_ = 0;
+    void registerRtModel(M2ModelGPU& gpuModel, const pipeline::M2Model& model);
+    void releaseRtModel(M2ModelGPU& gpuModel);
 
     // Previous frame's view-projection for temporal reprojection in HiZ culling.
     // Stored each frame so the cull shader can project into the same screen space

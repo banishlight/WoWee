@@ -62,6 +62,12 @@ public:
     float pendingFogSkyBlend = 0.7f;
     /// How much distance fog. See LightingManager::setFogStrength.
     float pendingFogStrength = 0.4f;
+    /// Volumetric fog: 0 off, 1-3 the volume's size. See VolumetricFog.
+    int pendingVolumetricFog = 2;
+    /// Ray traced lighting: 0 off, 1 sun, 2 + occlusion, 3 + bounce. See RtLighting.
+    int pendingRtLighting = 0;
+    /// A multiplier on how thick that mist is. See Renderer::setVolumetricFogDensity.
+    float pendingVolumetricDensity = 1.0f;
     bool pendingWaterRefraction = true;
     int pendingBrightness = 50; // 0-100, maps to 0.0-2.0 (50 = 1.0 default)
 
@@ -113,6 +119,9 @@ public:
     // ---- Pending UI / interface ----
     int pendingUiOpacity = 65;
     float pendingWindowUiScale = 1.0f;
+    /// Lines per unit of wheel travel in scrolling windows. See
+    /// LuaEngine::setWheelSensitivity.
+    float pendingScrollSpeed = 1.0f;
 
     /// What something drawn in pixels should be scaled to on a screen of a
     /// given height, before the player says otherwise.
@@ -163,6 +172,8 @@ public:
     bool pendingAutoSellGrey = false;
     bool pendingAutoRepair = false;
     bool pendingSecureAbilityToggle = false;
+    /// Debug: turn to face the target on attack. See GameHandler::setAutoFaceTarget.
+    bool pendingAutoFaceTarget = false;
     bool pendingIdleCameraOrbit = true;
 
     // ---- Pending soundtrack ----
@@ -207,12 +218,17 @@ public:
     int pendingGrassDistance = 150;  // 30-2000 yards; density thins past 45
     int pendingAntiAliasing = 1;  // 0=Off, 1=2x, 2=4x, 3=8x
     bool pendingFXAA = false;     // FXAA post-process (combinable with MSAA)
+    /// Ask GitHub at startup whether there is a newer release. On by
+    /// default: a bug reported against a version fixed weeks ago costs both
+    /// sides the whole exchange to find that out.
+    bool pendingCheckForUpdates = true;
     bool pendingNormalMapping = true;   // on by default
     float pendingNormalMapStrength = 0.8f;  // 0.0-2.0
     float pendingLensFlare = 1.0f;          // 0.0-2.0, sun flare strength
     int pendingFrameCap = 0;                // index into the frame-limit choices
     bool pendingPOM = true;             // on by default
     bool pendingSharpStars = true;
+    bool pendingSunShafts = true;       // screen-space rays from the sun
     int pendingPOMQuality = 1;          // 0=Low(16), 1=Medium(32), 2=High(64)
     bool pendingFSR = false;
     int pendingUpscalingMode = 0;       // 0=Off, 1=FSR1, 2=FSR3
@@ -273,6 +289,7 @@ public:
     bool showDPSMeter_ = false;
     bool showCooldownTracker_ = false;
     bool showRareTracker_ = false;  // Mark nearby spawned rares/rare-elites on both maps
+    bool showMapWindow_ = false;    // The world map on a window of its own (Application::updateMapWindow)
     bool showChestTracker_ = false; // Mark nearby spawned non-gather chests on the minimap
     bool damageFlashEnabled_ = true;
     bool lowHealthVignetteEnabled_ = true; // Persistent pulsing red vignette below 20% HP

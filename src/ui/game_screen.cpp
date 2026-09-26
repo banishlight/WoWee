@@ -160,24 +160,39 @@ bool GameScreen::getFullscreen() const {
 }
 
 void GameScreen::setFullscreen(bool enabled) {
+    const bool changed = settingsPanel_.pendingFullscreen != enabled;
     settingsPanel_.pendingFullscreen = enabled;
     if (services_.window) services_.window->setFullscreen(enabled);
+    // Kept for the next start, as the Display page's own row is: applied and
+    // not saved, the choice lasted until the client was closed.
+    if (changed) saveSettings();
 }
 
+// The resolution chosen, not the size the window happens to be.
+//
+// The game's video panel keeps the resolution it read when it was set up and
+// hands it back to SetScreenResolution on every Okay, changed or not - in the
+// real client that is harmless, because going full screen does not change the
+// chosen resolution. Answered from the window's size, going full screen did:
+// the desktop's size matched another row, or none, and Okay then applied the
+// row read before - which, full screen, switched the monitor to that mode, and
+// windowed moved and resized the window off the screen it had been on.
 int GameScreen::getResolutionIndex() const {
-    if (!services_.window) return settingsPanel_.pendingResIndex;
-    return displayResolutionIndexFor(services_.window->getWidth(),
-                                     services_.window->getHeight());
+    return displayResolutionIndexFor(settingsPanel_.pendingResolutionWidth,
+                                     settingsPanel_.pendingResolutionHeight);
 }
 
 void GameScreen::setResolutionIndex(int index) {
     if (index < 0 || index >= kNumDisplayResolutions) return;
+    // Asked for what is already chosen: the panel replaying its value on Okay.
+    if (index == getResolutionIndex()) return;
     settingsPanel_.pendingResIndex = index;
     settingsPanel_.pendingResolutionWidth  = kDisplayResolutions[index][0];
     settingsPanel_.pendingResolutionHeight = kDisplayResolutions[index][1];
     if (services_.window)
         services_.window->applyResolution(settingsPanel_.pendingResolutionWidth,
                                           settingsPanel_.pendingResolutionHeight);
+    saveSettings();
 }
 
 /// Anti-aliasing, shared with the interface's own Multisampling dropdown.
@@ -379,9 +394,9 @@ void GameScreen::render(game::GameHandler& gameHandler) {
             // soundtrack setting could be ignored for a whole run.
             if (!settingsPanel_.minimapSettingsApplied_) {
                 if (auto* minimap = renderer->getMinimap()) {
-                    settingsPanel_.minimapRotate_ = false;
-                    settingsPanel_.pendingMinimapRotate = false;
-                    minimap->setRotateWithCamera(false);
+                    // The saved rotation, not off. This forced it off at every
+                    // start, and the next save wrote the off back to the file.
+                    minimap->setRotateWithCamera(settingsPanel_.minimapRotate_);
                     minimap->setSquareShape(settingsPanel_.minimapSquare_);
                     settingsPanel_.minimapSettingsApplied_ = true;
                 }
@@ -587,6 +602,13 @@ void GameScreen::render(game::GameHandler& gameHandler) {
 
     // Apply auto-loot / auto-sell settings to GameHandler every frame (cheap bool sync)
     gameHandler.setAutoLoot(settingsPanel_.pendingAutoLoot);
+    gameHandler.setAutoFaceTarget(settingsPanel_.pendingAutoFaceTarget);
+    // Pushed rather than applied once: a /reload makes a new engine.
+    if (services_.addonManager) {
+        if (auto* engine = services_.addonManager->getLuaEngine()) {
+            engine->setWheelSensitivity(settingsPanel_.pendingScrollSpeed);
+        }
+    }
     gameHandler.setAutoSellGrey(settingsPanel_.pendingAutoSellGrey);
     gameHandler.setAutoRepair(settingsPanel_.pendingAutoRepair);
 
@@ -637,7 +659,14 @@ void GameScreen::render(game::GameHandler& gameHandler) {
         }
         if (cmds.toggleCombatLog) combatUI_.showCombatLog_ = !combatUI_.showCombatLog_;
         if (cmds.takeScreenshot) takeScreenshot();
+        switch (cmds.recording) {
+            case ChatPanel::SlashCommands::Recording::Toggle: toggleRecording(); break;
+            case ChatPanel::SlashCommands::Recording::Start:  startRecording();  break;
+            case ChatPanel::SlashCommands::Recording::Stop:   stopRecording();   break;
+            case ChatPanel::SlashCommands::Recording::None:   break;
+        }
     }
+    reportRecordingFailure();
 
     // ---- New UI elements ----
     auto spellIconFn = [this](uint32_t id, pipeline::AssetManager* am) { return getSpellIcon(id, am); };
@@ -1661,10 +1690,16 @@ void GameScreen::processTargetInput(game::GameHandler& gameHandler) {
             }
 
             if (KeybindingManager::getInstance().isActionPressed(KeybindingManager::Action::TOGGLE_NAMEPLATES)) {
-                if (ImGui::GetIO().KeyShift)
-                    settingsPanel_.showFriendlyNameplates_ = !settingsPanel_.showFriendlyNameplates_;
-                else
-                    settingsPanel_.showEnemyNameplates_ = !settingsPanel_.showEnemyNameplates_;
+                // Through the setter and saved, like the panel's boxes. Both
+                // are bound to CVars, and the store is applied over the
+                // settings file at start-up - flipped here alone, the choice
+                // lasted until the client was closed.
+                const bool friendly = ImGui::GetIO().KeyShift;
+                const bool shown = friendly ? settingsPanel_.showFriendlyNameplates_
+                                            : settingsPanel_.showEnemyNameplates_;
+                settingsPanel_.setSettingValue(friendly ? "friendlyplates" : "enemyplates",
+                                               shown ? "0" : "1");
+                saveSettings();
             }
 
             if (KeybindingManager::getInstance().isActionPressed(KeybindingManager::Action::TOGGLE_WORLD_MAP)) {
@@ -1717,9 +1752,14 @@ void GameScreen::processTargetInput(game::GameHandler& gameHandler) {
                 gameHandler.runInterfaceCommand("TogglePVPFrame()");
             }
 
-            // Screenshot (PrintScreen key)
+            // Screenshot (PrintScreen key), and with Shift held, start or
+            // stop a recording.
             if (input.isKeyJustPressed(SDL_SCANCODE_PRINTSCREEN)) {
-                takeScreenshot();
+                if (input.isKeyPressed(SDL_SCANCODE_LSHIFT) || input.isKeyPressed(SDL_SCANCODE_RSHIFT)) {
+                    toggleRecording();
+                } else {
+                    takeScreenshot();
+                }
             }
 
             // Action bar keys (1-9, 0, -, =)
@@ -2158,6 +2198,17 @@ void GameScreen::processTargetInput(game::GameHandler& gameHandler) {
                         if (!unit->isHostile() && canInteractNpc) {
                             gameHandler.interactWithNpc(target->getGuid());
                         } else if (unit->isHostile() || shouldAttackByFallback) {
+                            // Said once per unit: a creature nobody thinks is
+                            // hostile, attacked because it carries no NPC flags,
+                            // is a talk that never left this client.
+                            if (!unit->isHostile()) {
+                                static std::unordered_set<uint64_t> said;
+                                if (said.insert(target->getGuid()).second) {
+                                    LOG_WARNING("Right-click: ", unit->getName(),
+                                                " is not hostile and has no NPC flags,"
+                                                " so it was attacked rather than spoken to");
+                                }
+                            }
                             gameHandler.startAutoAttack(target->getGuid());
                         }
                     }

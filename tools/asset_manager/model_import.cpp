@@ -4,6 +4,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <set>
 
@@ -88,24 +89,23 @@ bool md21Body(const std::vector<uint8_t>& blob, std::vector<uint8_t>& body,
 /// types 11 to 13 are a creature's skin, which the client composes from
 /// CreatureDisplayInfo and which is empty here by design. So an empty name
 /// means opposite things in the two cases, and only the first is a fault.
-/// How many monster skins a model expects the client to hand it.
+/// The slots a creature's CreatureDisplayInfo row fills.
 ///
-/// Types 11, 12 and 13 are MONSTER_1 to MONSTER_3, filled from a
-/// CreatureDisplayInfo row's three texture columns. A model asking for more of
-/// them than the row has is a model the data cannot dress: the columns were
-/// written for the model that shipped with them.
-std::size_t monsterSkinSlots(const std::vector<uint8_t>& body) {
-    if (body.size() < kTexturesOffset + 4) return 0;
+/// Types 11, 12 and 13 are MONSTER_1 to MONSTER_3: the client dresses them with
+/// the row's three texture columns, and those name art painted for the model
+/// that shipped with the row - its UV layout, not a later one's.
+std::vector<std::size_t> tableSkinSlots(const std::vector<uint8_t>& body) {
+    std::vector<std::size_t> slots;
+    if (body.size() < kTexturesOffset + 4) return slots;
     const uint32_t count = readLE32(body.data() + kTexturesCount);
     const uint32_t offset = readLE32(body.data() + kTexturesOffset);
-    if (count > 512) return 0;
+    if (count > 512) return slots;
 
-    std::size_t slots = 0;
     for (uint32_t i = 0; i < count; ++i) {
         const std::size_t entry = offset + std::size_t(i) * 16;
         if (entry + 16 > body.size()) break;
         const uint32_t kind = readLE32(body.data() + entry);
-        if (kind >= 11 && kind <= 13) ++slots;
+        if (kind >= 11 && kind <= 13) slots.push_back(i);
     }
     return slots;
 }
@@ -146,17 +146,24 @@ bool anyBatchSamples(const std::vector<uint8_t>& skin, const std::vector<uint8_t
     return false;
 }
 
-/// The texture files a model names for itself, and which of its slots it left
-/// unnamed while claiming to name them.
+/// The texture files a model names for itself, the slot each is in, and which
+/// of its slots it left unnamed while claiming to name them.
+///
+/// Type 0 only, for the names. Every other type is a slot the client fills -
+/// the monster skins from CreatureDisplayInfo, the body from CharSections - and
+/// it never loads a name found on one, so a leftover path there is neither a
+/// file to fetch nor a reason to refuse the model.
 ///
 /// Types 11 to 13 are the creature skin, filled from CreatureDisplayInfo at
 /// draw time, so an empty name there is correct. Type 0 is the model naming its
 /// own file, and an empty name there means it named it by id through a chunk
 /// this does not read.
 std::vector<std::string> texturePaths(const std::vector<uint8_t>& body,
-                                      std::vector<std::size_t>* unnamedOwn) {
+                                      std::vector<std::size_t>* unnamedOwn,
+                                      std::vector<std::size_t>* namedSlots) {
     std::vector<std::string> out;
     if (unnamedOwn) unnamedOwn->clear();
+    if (namedSlots) namedSlots->clear();
     if (body.size() < kTexturesOffset + 4) return out;
 
     const uint32_t count = readLE32(body.data() + kTexturesCount);
@@ -176,21 +183,37 @@ std::vector<std::string> texturePaths(const std::vector<uint8_t>& body,
             const std::size_t nul = name.find('\0');
             if (nul != std::string::npos) name.resize(nul);
         }
-        if (!name.empty()) out.push_back(name);
-        else if (kind == 0 && unnamedOwn) unnamedOwn->push_back(i);
+        if (kind != 0) continue;
+        if (!name.empty()) {
+            out.push_back(name);
+            if (namedSlots) namedSlots->push_back(i);
+        } else if (unnamedOwn) {
+            unnamedOwn->push_back(i);
+        }
     }
     return out;
 }
 
-std::string modelName(const std::vector<uint8_t>& body) {
-    if (body.size() < 16) return {};
-    const uint32_t length = readLE32(body.data() + 8);
-    const uint32_t at = readLE32(body.data() + 12);
-    if (length == 0 || at + length > body.size()) return {};
-    std::string name(reinterpret_cast<const char*>(body.data() + at), length);
-    const std::size_t nul = name.find('\0');
-    if (nul != std::string::npos) name.resize(nul);
-    return name;
+std::vector<uint8_t> readBytes(const fs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return {};
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(in)),
+                                std::istreambuf_iterator<char>());
+}
+
+/// The skin columns a batch of this model draws: 0 to 2 for MONSTER_1 to
+/// MONSTER_3, which is also the display row's column for each.
+std::vector<int> drawnTableColumns(const std::vector<uint8_t>& skin,
+                                   const std::vector<uint8_t>& body) {
+    std::vector<int> columns;
+    const uint32_t textureAt = readLE32(body.data() + kTexturesOffset);
+    for (std::size_t slot : tableSkinSlots(body)) {
+        if (!anyBatchSamples(skin, body, {slot})) continue;
+        const int column = static_cast<int>(readLE32(body.data() + textureAt + slot * 16)) - 11;
+        if (std::find(columns.begin(), columns.end(), column) == columns.end())
+            columns.push_back(column);
+    }
+    return columns;
 }
 
 bool writeFile(const fs::path& path, const uint8_t* data, std::size_t size) {
@@ -206,8 +229,8 @@ bool writeFile(const fs::path& path, const uint8_t* data, std::size_t size) {
 
 std::size_t indexLocalModels(const std::string& expansionDir,
                              std::vector<ImportCandidate>* out) {
-    // name -> (vertices, game-relative path, came from override, monster skins)
-    std::map<std::string, std::tuple<uint32_t, std::string, bool, uint32_t>> found;
+    // name -> (vertices, game-relative path, came from override, the file itself)
+    std::map<std::string, std::tuple<uint32_t, std::string, bool, std::string>> found;
     std::error_code ec;
     const fs::path root(expansionDir);
 
@@ -228,28 +251,6 @@ std::size_t indexLocalModels(const std::string& expansionDir,
         const std::size_t shift = version >= 264 ? 0 : 8;
         const uint32_t vertices = readLE32(head + 60 + shift);
 
-        // The monster-skin slots, read by seeking to the texture array rather
-        // than reading the file: it sits wherever the model put it, which for
-        // a character model is megabytes in.
-        uint32_t monsterSkins = 0;
-        {
-            const uint32_t texCount = readLE32(head + kTexturesCount + shift);
-            const uint32_t texOffset = readLE32(head + kTexturesOffset + shift);
-            if (texCount > 0 && texCount <= 512) {
-                std::vector<uint8_t> entries(std::size_t(texCount) * 16);
-                in.seekg(texOffset);
-                in.read(reinterpret_cast<char*>(entries.data()),
-                        static_cast<std::streamsize>(entries.size()));
-                if (in.gcount() == static_cast<std::streamsize>(entries.size())) {
-                    for (uint32_t i = 0; i < texCount; ++i) {
-                        const uint32_t kind = readLE32(entries.data() + std::size_t(i) * 16);
-                        if (kind >= 11 && kind <= 13) ++monsterSkins;
-                    }
-                }
-            }
-            in.clear();
-        }
-
         fs::path relative = fs::relative(it->path(), root, ec);
         std::string first = relative.begin() != relative.end()
                             ? lower(relative.begin()->string()) : std::string();
@@ -269,7 +270,7 @@ std::size_t indexLocalModels(const std::string& expansionDir,
         const std::string key = lower(filename.substr(0, filename.size() - 3));
         auto existing = found.find(key);
         if (existing == found.end()) {
-            found[key] = {vertices, relative.generic_string(), overridden, monsterSkins};
+            found[key] = {vertices, relative.generic_string(), overridden, it->path().string()};
         } else {
             const bool wasOverride = std::get<2>(existing->second);
             const uint32_t wasVertices = std::get<0>(existing->second);
@@ -279,9 +280,10 @@ std::size_t indexLocalModels(const std::string& expansionDir,
             // installed reads as an improvement worth making again - and a
             // better model gets replaced by a poorer one.
             if (overridden && !wasOverride) {
-                existing->second = {vertices, relative.generic_string(), true, monsterSkins};
+                existing->second = {vertices, relative.generic_string(), true, it->path().string()};
             } else if (overridden == wasOverride && vertices > wasVertices) {
-                existing->second = {vertices, relative.generic_string(), overridden, monsterSkins};
+                existing->second = {vertices, relative.generic_string(), overridden,
+                                    it->path().string()};
             }
         }
     }
@@ -293,11 +295,145 @@ std::size_t indexLocalModels(const std::string& expansionDir,
             candidate.name = key;
             candidate.localVertices = std::get<0>(record);
             candidate.destination = std::get<1>(record);
-            candidate.localMonsterSkins = std::get<3>(record);
+            candidate.localPath = std::get<3>(record);
             out->push_back(std::move(candidate));
         }
     }
     return found.size();
+}
+
+std::map<std::string, std::vector<std::array<std::string, 3>>>
+tableSkinsByModel(const std::string& expansionDir) {
+    std::map<std::string, std::vector<std::array<std::string, 3>>> out;
+
+    // WDBC: a 20-byte header, fixed-size records of 32-bit fields, then the
+    // strings the records point into. The columns read here are where every
+    // expansion this client knows keeps them - dbc_layouts.json agrees for
+    // classic, tbc, wotlk and turtle: CreatureModelData's path is field 2,
+    // CreatureDisplayInfo's model is field 1 and its skins fields 6 to 8.
+    struct Table {
+        std::vector<uint8_t> blob;
+        uint32_t records = 0, fields = 0, recordSize = 0, strings = 0;
+        bool read(const fs::path& path) {
+            blob = readBytes(path);
+            if (blob.size() < 20 || std::memcmp(blob.data(), "WDBC", 4) != 0) return false;
+            records = readLE32(blob.data() + 4);
+            fields = readLE32(blob.data() + 8);
+            recordSize = readLE32(blob.data() + 12);
+            strings = readLE32(blob.data() + 16);
+            return blob.size() >= 20 + std::size_t(records) * recordSize + strings;
+        }
+        uint32_t u32(uint32_t row, uint32_t field) const {
+            if (field >= fields) return 0;
+            return readLE32(blob.data() + 20 + std::size_t(row) * recordSize + field * 4);
+        }
+        std::string text(uint32_t row, uint32_t field) const {
+            const uint32_t at = u32(row, field);
+            const std::size_t base = 20 + std::size_t(records) * recordSize;
+            if (at >= strings) return {};
+            const char* s = reinterpret_cast<const char*>(blob.data() + base + at);
+            return std::string(s, std::find(s, s + (strings - at), '\0'));
+        }
+    };
+    auto normalise = [](std::string path) {
+        path = lower(path);
+        std::replace(path.begin(), path.end(), '\\', '/');
+        return path;
+    };
+
+    const fs::path tables = fs::path(expansionDir) / "dbfilesclient";
+    Table models, displays;
+    if (!models.read(tables / "creaturemodeldata.dbc") ||
+        !displays.read(tables / "creaturedisplayinfo.dbc")) {
+        return out;
+    }
+
+    // The model path as the table writes it - Creature\Ogre02\Ogre02.mdx - in
+    // the spelling the extraction and the importer use: creature/ogre02/ogre02.m2.
+    std::map<uint32_t, std::string> modelPath;
+    for (uint32_t r = 0; r < models.records; ++r) {
+        std::string path = normalise(models.text(r, 2));
+        const std::size_t dot = path.rfind('.');
+        if (dot == std::string::npos) continue;
+        path = path.substr(0, dot) + ".m2";
+        modelPath[models.u32(r, 0)] = path;
+    }
+
+    for (uint32_t r = 0; r < displays.records; ++r) {
+        auto model = modelPath.find(displays.u32(r, 1));
+        if (model == modelPath.end()) continue;
+        const std::string folder = fs::path(model->second).parent_path().generic_string();
+        std::array<std::string, 3> skins;
+        for (int column = 0; column < 3; ++column) {
+            const std::string name = displays.text(r, 6 + column);
+            if (!name.empty()) skins[column] = normalise(folder + "/" + name + ".blp");
+        }
+        auto& rows = out[model->second];
+        if (std::find(rows.begin(), rows.end(), skins) == rows.end()) rows.push_back(skins);
+    }
+    return out;
+}
+
+RepairResult repairEarlierImports(const std::string& expansionDir) {
+    RepairResult result;
+    const fs::path root(expansionDir);
+    const fs::path overrides = root / "override";
+    std::error_code ec;
+    if (!fs::is_directory(overrides, ec)) return result;
+
+    auto resolves = [&](const std::string& name) {
+        std::string relative = lower(name);
+        std::replace(relative.begin(), relative.end(), '\\', '/');
+        std::error_code existsEc;
+        return fs::is_regular_file(overrides / relative, existsEc) ||
+               fs::is_regular_file(root / relative, existsEc);
+    };
+
+    for (fs::recursive_directory_iterator it(overrides, ec), end; it != end && !ec;
+         it.increment(ec)) {
+        std::error_code fileEc;
+        if (!it->is_regular_file(fileEc)) continue;
+        const fs::path path = it->path();
+        if (path.filename().string().rfind("._", 0) == 0) continue;
+        if (lower(path.extension().string()) != ".m2") continue;
+
+        std::vector<uint8_t> body = readBytes(path);
+        // Wrath's layout only: every offset below is where 264 keeps it, and
+        // that is what the importer writes.
+        if (body.size() < kTextureCombosOffset + 4 || std::memcmp(body.data(), "MD20", 4) != 0 ||
+            readLE32(body.data() + 4) < kWotlkVersion) {
+            continue;
+        }
+        ++result.modelsLooked;
+
+        // The first skin, the one the importer's own tests read. A model with
+        // no skin beside it is not something to reason about.
+        const std::string stem = path.stem().string();
+        const std::vector<uint8_t> skin = readBytes(path.parent_path() / (stem + "00.skin"));
+        if (skin.empty()) continue;
+
+        std::vector<std::size_t> namedSlots;
+        const std::vector<std::string> names = texturePaths(body, nullptr, &namedSlots);
+        std::vector<std::size_t> missing;
+        for (std::size_t t = 0; t < names.size(); ++t) {
+            if (!resolves(names[t])) missing.push_back(namedSlots[t]);
+        }
+        if (missing.empty()) continue;
+
+        const uint32_t textureAt = readLE32(body.data() + kTexturesOffset);
+        std::size_t cleared = 0;
+        for (std::size_t slot : missing) {
+            if (anyBatchSamples(skin, body, {slot})) { ++result.leftDrawn; continue; }
+            writeLE32(body.data() + textureAt + slot * 16 + 8, 0);    // name length
+            writeLE32(body.data() + textureAt + slot * 16 + 12, 0);   // name offset
+            ++cleared;
+        }
+        if (cleared == 0) continue;
+        if (!writeFile(path, body.data(), body.size())) continue;
+        ++result.modelsRepaired;
+        result.namesCleared += cleared;
+    }
+    return result;
 }
 
 ImportResult importModels(ModelSource& source, const std::string& expansionDir,
@@ -314,6 +450,73 @@ ImportResult importModels(ModelSource& source, const std::string& expansionDir,
     const std::string wantPrefix = lower(prefix);
     std::set<std::string> fetched;
     std::set<std::string> failedTextures;
+
+    // The skins a creature is dressed in, and where the later copies of them go.
+    //
+    // Into the override directory, never over the extracted file: the client
+    // reads that directory first, and the extracted copy is what tells a
+    // repainted skin from one the later client never touched.
+    const auto tableSkins = tableSkinsByModel(expansionDir);
+    const fs::path overrideRoot = fs::path(outputDir) / "override";
+
+    // The later install's copies of every skin the display rows name for this
+    // model, in the columns it draws - or why they cannot dress it. Only the
+    // files not already in the override directory as the later copy are
+    // returned to be written.
+    //
+    // Two answers refuse. A row with nothing in a column the model draws leaves
+    // that part of it bare - Legion's boar draws a second skin, for its mane,
+    // that no 3.3.5 row names. And a skin the later install holds byte for byte
+    // as extracted was not repainted for the later mesh, so the later client
+    // must dress it from files these rows never name.
+    struct SkinFetch {
+        bool ok = false;
+        std::string why;
+        std::vector<std::pair<std::string, std::vector<uint8_t>>> files;
+    };
+    auto fetchTableSkins = [&](const std::string& model,
+                               const std::vector<int>& columns) -> SkinFetch {
+        SkinFetch out;
+        auto rows = tableSkins.find(lower(model));
+        if (rows == tableSkins.end() || rows->second.empty()) {
+            out.why = "no display row names its skins";
+            return out;
+        }
+        std::set<std::string> wanted;
+        for (const auto& row : rows->second) {
+            for (int column : columns) {
+                if (row[column].empty()) {
+                    out.why = "it draws a skin a display row leaves empty";
+                    return out;
+                }
+                wanted.insert(row[column]);
+            }
+        }
+        for (const std::string& skin : wanted) {
+            std::vector<uint8_t> theirs = source.read(skin);
+            if (theirs.empty()) {
+                out.why = "the later install has no " + skin;
+                return out;
+            }
+            const std::vector<uint8_t> original = readBytes(fs::path(expansionDir) / skin);
+            if (!original.empty() && original == theirs) {
+                out.why = skin + " was not repainted for the later mesh";
+                return out;
+            }
+            if (readBytes(overrideRoot / skin) != theirs) {
+                out.files.emplace_back(skin, std::move(theirs));
+            }
+        }
+        out.ok = true;
+        return out;
+    };
+    auto writeSkins = [&](const SkinFetch& fetch) {
+        for (const auto& [skin, bytes] : fetch.files) {
+            if (writeFile(overrideRoot / skin, bytes.data(), bytes.size())) {
+                ++result.tableSkinsBrought;
+            }
+        }
+    };
 
     // Asked for by path, one local model at a time, rather than by sweeping the
     // whole installation and matching on the name inside each file.
@@ -358,6 +561,97 @@ ImportResult importModels(ModelSource& source, const std::string& expansionDir,
             (candidate.localVertices < 20 ||
              float(theirVertices) <= float(candidate.localVertices) * betterRatio)) {
             ++result.notBetter;
+            // An earlier run's import may be sitting here, and the pipelines
+            // before this one left two kinds of creature wearing skins that do
+            // not fit it. See the two cases below.
+            if (!candidate.localPath.empty()) {
+                const fs::path localModel(candidate.localPath);
+                const std::vector<uint8_t> localBody = readBytes(localModel);
+                const std::vector<uint8_t> localSkin = readBytes(
+                    localModel.parent_path() / (localModel.stem().string() + "00.skin"));
+                const bool readable = localBody.size() >= kTextureCombosOffset + 4 &&
+                                      std::memcmp(localBody.data(), "MD20", 4) == 0 &&
+                                      readLE32(localBody.data() + 4) >= kWotlkVersion &&
+                                      !localSkin.empty();
+                const std::vector<int> columns =
+                    readable ? drawnTableColumns(localSkin, localBody) : std::vector<int>{};
+                // An import, and not the extracted original the later client
+                // happens to share: only an import sits in the override
+                // directory. The importer itself writes over the extracted
+                // file, and there nothing tells the two apart.
+                std::error_code relEc;
+                const std::string underOverride =
+                    fs::relative(localModel, overrideRoot, relEc).generic_string();
+                const bool isEarlierImport = !relEc && !underOverride.empty() &&
+                                             underOverride.rfind("..", 0) != 0;
+
+                // Nothing can dress it, so it comes out, with what was written
+                // beside it, and the extracted model under it is drawn again.
+                // Textures stay: they may be shared.
+                auto removeEarlierImport = [&](const std::string& why) {
+                    const std::string stemLower = lower(localModel.stem().string());
+                    std::error_code dirEc;
+                    std::vector<fs::path> beside;
+                    for (const auto& entry :
+                         fs::directory_iterator(localModel.parent_path(), dirEc)) {
+                        const std::string name = lower(entry.path().filename().string());
+                        const std::string ext = lower(entry.path().extension().string());
+                        if (name.rfind(stemLower, 0) != 0) continue;
+                        if (ext != ".skin" && ext != ".anim") continue;
+                        // "00.skin", "0060-00.anim": digits and a dash between
+                        // the stem and the extension. ogre and ogrewarlord
+                        // share a prefix and differ here.
+                        const std::string middle = name.substr(
+                            stemLower.size(), name.size() - stemLower.size() - ext.size());
+                        if (!middle.empty() &&
+                            middle.find_first_not_of("0123456789-") == std::string::npos) {
+                            beside.push_back(entry.path());
+                        }
+                    }
+                    std::error_code rmEc;
+                    if (fs::remove(localModel, rmEc)) {
+                        for (const fs::path& p : beside) fs::remove(p, rmEc);
+                        ++result.earlierImportsRemoved;
+                        if (say) say("    removed an earlier import of " + where + ": " + why);
+                    }
+                };
+
+                if (!columns.empty() && isEarlierImport) {
+                    if (theirVertices == candidate.localVertices) {
+                        // The later client's own model, brought without the
+                        // skins its display rows name.
+                        const SkinFetch fetch = fetchTableSkins(where, columns);
+                        if (fetch.ok) {
+                            if (!fetch.files.empty()) {
+                                writeSkins(fetch);
+                                ++result.earlierImportsDressed;
+                            }
+                        } else {
+                            removeEarlierImport(fetch.why);
+                        }
+                    } else if (float(candidate.localVertices) > float(theirVertices) * 1.1f ||
+                               float(candidate.localVertices) * 1.1f < float(theirVertices)) {
+                        // Not the later client's model at this path at all.
+                        // An earlier pack filed models under the community
+                        // listfile's names, which guess: what it installed as
+                        // creature/ridinghorse/ridinghorse.m2 is Legion's
+                        // HorseMultiSaddle, 3155 vertices, while Legion's own
+                        // file at that path is the 673-vertex horse 3.3.5
+                        // ships. The displays that name this path are dressed
+                        // for that horse, in 3.3.5 and in Legion alike, so no
+                        // skin they name can fit what is here.
+                        removeEarlierImport(
+                            "not the later client's model at this path (" +
+                            std::to_string(candidate.localVertices) + " vertices here, " +
+                            std::to_string(theirVertices) + " in the later install), so the "
+                            "skins named for this path do not fit it");
+                    }
+                    // Within a tenth either way it is the same model exported
+                    // again with small edits - Legion's banshee is 1141
+                    // vertices, an earlier pack's 1132 - and the skins named
+                    // for it still fit.
+                }
+            }
             continue;
         }
 
@@ -419,24 +713,29 @@ ImportResult importModels(ModelSource& source, const std::string& expansionDir,
             continue;
         }
 
-        // A creature is dressed from its CreatureDisplayInfo row, and that row
-        // was written for the model that shipped with it. A later model with
-        // more monster-skin slots than the one it replaces has slots nothing
-        // can fill - Legion's boar carries a second one for its mane, and
-        // 3.3.5's row names a body skin and nothing else, so the mane draws
-        // untextured however well the rest goes.
-        // Only where the model here has monster skins of its own. With none,
-        // there is no CreatureDisplayInfo row behind it to be outgrown - a
-        // doodad that happens to carry one of these slots is not a creature
-        // and is not dressed from that table.
-        if (candidate.localMonsterSkins > 0 &&
-            monsterSkinSlots(body) > candidate.localMonsterSkins) {
-            ++result.needsMoreSkins;
-            continue;
+        // A creature dressed from its CreatureDisplayInfo row brings the later
+        // copies of the skins that row names, or does not come at all. The
+        // mesh is laid out for them: Legion's ogre wore 3.3.5's
+        // Ogre02SkinBlue512 across a body UV-mapped for Legion's repaint of that
+        // same file, and the Warmaul Reavers in Nagrand came out a patchwork.
+        //
+        // Only when a batch draws one of those slots. A model that carries
+        // them unused is dressed by its own named textures, which the checks
+        // below bring over or refuse.
+        SkinFetch tableSkinFetch;
+        if (const std::vector<int> columns = drawnTableColumns(sidecars.front().second, body);
+            !columns.empty()) {
+            tableSkinFetch = fetchTableSkins(where, columns);
+            if (!tableSkinFetch.ok) {
+                ++result.dressedByTable;
+                if (say) say("    " + where + " not taken: " + tableSkinFetch.why);
+                continue;
+            }
         }
 
         std::vector<std::size_t> unnamedOwn;
-        const std::vector<std::string> textures = texturePaths(body, &unnamedOwn);
+        std::vector<std::size_t> namedSlots;
+        const std::vector<std::string> textures = texturePaths(body, &unnamedOwn, &namedSlots);
         if (!unnamedOwn.empty() && anyBatchSamples(sidecars.front().second, body, unnamedOwn)) {
             // A type 0 slot with no name is a model naming its own texture by
             // FileDataID through a chunk this does not read. The client cannot
@@ -450,23 +749,31 @@ ImportResult importModels(ModelSource& source, const std::string& expansionDir,
         // Everything is resolved before anything is written: a model whose
         // textures did not arrive is the half-written model the refusals exist
         // to prevent.
+        //
+        // Half-written means a texture something draws. Later models name
+        // files they never sample - reflection and environment maps in slots
+        // no batch reaches, a sixth of one install's worth - and the rule that
+        // excuses an unnamed slot no batch draws applies to a named one just
+        // the same. Such a slot is kept and its name cleared, so the client
+        // neither goes looking for the file nor warns that it is not there.
         std::vector<std::pair<std::string, std::vector<uint8_t>>> pending;
-        bool missing = false;
-        for (const std::string& texture : textures) {
+        std::vector<std::size_t> unfetched;
+        for (std::size_t t = 0; t < textures.size(); ++t) {
+            const std::string& texture = textures[t];
             std::string key = lower(texture);
             std::replace(key.begin(), key.end(), '\\', '/');
             if (fetched.count(key)) continue;
-            if (failedTextures.count(key)) { missing = true; break; }
+            if (failedTextures.count(key)) { unfetched.push_back(namedSlots[t]); continue; }
             std::vector<uint8_t> bytes = source.read(texture);
             if (bytes.empty()) {
                 failedTextures.insert(key);
-                missing = true;
+                unfetched.push_back(namedSlots[t]);
                 if (say) say("    texture not in this install: " + texture);
-                break;
+                continue;
             }
             pending.emplace_back(texture, std::move(bytes));
         }
-        if (missing) {
+        if (!unfetched.empty() && anyBatchSamples(sidecars.front().second, body, unfetched)) {
             ++result.missingTextures;
             continue;
         }
@@ -520,11 +827,21 @@ ImportResult importModels(ModelSource& source, const std::string& expansionDir,
 
         std::vector<uint8_t> patched = body;
         writeLE32(patched.data() + 4, kWotlkVersion);
+        if (!unfetched.empty()) {
+            const uint32_t textureAt = readLE32(patched.data() + kTexturesOffset);
+            for (std::size_t slot : unfetched) {
+                const std::size_t entry = textureAt + slot * 16;
+                writeLE32(patched.data() + entry + 8, 0);    // name length
+                writeLE32(patched.data() + entry + 12, 0);   // name offset
+            }
+            result.unusedTexturesCleared += unfetched.size();
+        }
         if (!writeFile(destination, patched.data(), patched.size())) continue;
 
         for (const auto& [path, bytes] : sidecars) {
             writeFile(path, bytes.data(), bytes.size());
         }
+        writeSkins(tableSkinFetch);
 
         for (auto& [texture, bytes] : pending) {
             // Lowercased, because that is how extraction spells every path it

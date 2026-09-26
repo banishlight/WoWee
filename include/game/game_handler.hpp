@@ -1617,15 +1617,34 @@ public:
     // Faction hostility map (populated from FactionTemplate.dbc by Application)
     void setFactionHostileMap(std::unordered_map<uint32_t, bool> map) { factionHostileMap_ = std::move(map); }
     void setFactionFriendlyMap(std::unordered_map<uint32_t, bool> map) { factionFriendlyMap_ = std::move(map); }
+    /// The templates whose faction the player has a standing with, by that
+    /// standing's index in the server's list. See factionAtWarLive.
+    void setFactionTemplateRepList(std::unordered_map<uint32_t, uint32_t> map) {
+        factionTemplateRepList_ = std::move(map);
+    }
     /// Whether a beneficial spell may be aimed at this faction.
     ///
     /// Not the negation of isHostileFaction: a faction can be neither, and most
     /// wildlife is. Unknown answers false, so a spell falls back to the caster
     /// rather than being sent at something the server will refuse.
     bool isFriendlyFaction(uint32_t factionTemplateId) const {
+        if (const int atWar = factionAtWarLive(factionTemplateId); atWar >= 0) return atWar == 0;
         auto it = factionFriendlyMap_.find(factionTemplateId);
         return it != factionFriendlyMap_.end() ? it->second : false;
     }
+    /// Re-judge every unit's hostility, after the at-war state it came from
+    /// has changed. A unit's is worked out when it appears and kept.
+    void refreshUnitHostility();
+    /// How a unit regards the player, numbered as UnitReaction numbers it:
+    /// 1 hated to 8 exalted. For a faction the player has a standing with,
+    /// that standing - no better than neutral while at war - and otherwise 2
+    /// hostile, 5 friendly, 4 neither.
+    ///
+    /// Not the same question as isHostileFaction, which is whether the player
+    /// may attack it. The Kurenai are not attackable by an Alliance player at
+    /// any standing, but at Unfriendly they will not talk to one either, and
+    /// the server refuses the conversation on exactly this number.
+    [[nodiscard]] int unitReactionToPlayer(const Unit& unit) const;
 
     // Creature move callback (online mode - triggered by SMSG_MONSTER_MOVE)
     // Parameters: guid, x, y, z (canonical), duration_ms (0 = instant)
@@ -1729,6 +1748,9 @@ public:
     }
     uint8_t lookupPlayerRace(uint64_t guid) const {
         return entityController_->lookupPlayerRace(guid);
+    }
+    uint8_t lookupPlayerGender(uint64_t guid) const {
+        return entityController_->lookupPlayerGender(guid);
     }
 
     // Look up a display name for any guid: checks playerNameCache then entity manager.
@@ -2052,6 +2074,12 @@ public:
     const LootResponseData& getCurrentLoot() const;
     void setAutoLoot(bool enabled);
     bool isAutoLoot() const;
+    /// Turn the player to face the target when an attack or a targeted spell
+    /// starts. Off by default, as the original client has it: a target behind
+    /// the player has to be faced first, and the server says so. A debugging
+    /// aid, set from the Combat page.
+    void setAutoFaceTarget(bool enabled) { autoFaceTarget_ = enabled; }
+    [[nodiscard]] bool isAutoFaceTarget() const { return autoFaceTarget_; }
     void setAutoSellGrey(bool enabled);
     bool isAutoSellGrey() const;
     void setAutoRepair(bool enabled);
@@ -2159,7 +2187,14 @@ public:
     void setQuestTracked(uint32_t questId, bool tracked) {
         const bool changed = tracked ? trackedQuestIds_.insert(questId).second
                                      : trackedQuestIds_.erase(questId) > 0;
-        if (changed) saveCharacterConfig();
+        if (changed) {
+            saveCharacterConfig();
+            // WatchFrame is purely event-driven and never polls native state,
+            // so a change here is invisible to it until something else happens
+            // to fire QUEST_LOG_UPDATE (e.g. the quest log's own track/untrack
+            // button, which calls WatchFrame_Update() directly).
+            fireAddonEvent("QUEST_LOG_UPDATE", {});
+        }
     }
     const std::unordered_set<uint32_t>& getTrackedQuestIds() const;
     /// The quests whose objective areas the world map shades.
@@ -2467,6 +2502,17 @@ public:
     }
     // Returns the faction ID for a given repListId (0 if unknown)
     uint32_t getFactionIdByRepListId(uint32_t repListId) const;
+    /// Where this character's standing with a faction starts, by race and
+    /// class, from Faction.dbc.
+    ///
+    /// The part of every standing the server leaves out. SMSG_INITIALIZE_FACTIONS
+    /// and SMSG_SET_FACTION_STANDING carry what has been earned, and the client
+    /// adds this - the server's own total is the two together. Read as the
+    /// whole, every faction with a starting value came out wrong: an Alliance
+    /// character starts at -1200 with the Kurenai, so 900 earned showed as
+    /// Neutral while the server held them at Unfriendly and Telaar would not
+    /// speak to them.
+    int32_t factionBaseReputation(uint32_t factionId) const;
     // Returns the repListId for a given faction ID (0xFFFFFFFF if not found)
     uint32_t getRepListIdByFactionId(uint32_t factionId) const;
     // Shaman totems (4 slots: 0=Earth, 1=Fire, 2=Water, 3=Air)
@@ -2997,6 +3043,8 @@ public:
     // Positive = nose up, negative = nose down.
     void setMovementPitch(float radians) { movementInfo.pitch = radians; }
     void dismount();
+    /// In the air on a flying mount or not - see MovementHandler::setFlightAirborne.
+    void setFlightAirborne(bool airborne);
 
     /// Accept the innkeeper's offer to make this the player's home. The prompt
     /// arrives as SMSG_BINDER_CONFIRM and this is the reply.
@@ -3971,8 +4019,18 @@ public:
         uint32_t suffixFactor = 0;       // ITEM_FIELD_PROPERTY_SEED (random-suffix stat scale)
     };
     bool isHostileFaction(uint32_t factionTemplateId) const {
+        if (const int atWar = factionAtWarLive(factionTemplateId); atWar >= 0) return atWar == 1;
         auto it = factionHostileMap_.find(factionTemplateId);
         return it != factionHostileMap_.end() ? it->second : true;
+    }
+    /// For a template whose faction carries a standing: 1 while the server
+    /// says the player is at war with it, 0 when not, and -1 when it is not
+    /// such a template or the standings have not arrived - the maps above,
+    /// built from the starting standings, answer until then.
+    int factionAtWarLive(uint32_t factionTemplateId) const {
+        auto it = factionTemplateRepList_.find(factionTemplateId);
+        if (it == factionTemplateRepList_.end() || it->second >= initialFactions_.size()) return -1;
+        return isFactionAtWar(it->second) ? 1 : 0;
     }
 
 private:
@@ -4489,6 +4547,9 @@ private:
     mutable std::unordered_map<uint32_t, uint32_t> factionRepListToId_;
     // factionId → repListId reverse mapping
     mutable std::unordered_map<uint32_t, uint32_t> factionIdToRepList_;
+    // factionId → Faction.dbc's four race masks, four class masks and four
+    // starting values, in that order. See factionBaseReputation.
+    mutable std::unordered_map<uint32_t, std::array<int32_t, 12>> factionRepBase_;
     mutable bool factionNameCacheLoaded_ = false;
 
     // ---- Group ----
@@ -4538,6 +4599,7 @@ private:
     // ---- Loot ----
     bool lootWindowOpen = false;
     bool autoLoot_ = false;
+    bool autoFaceTarget_ = false;
     bool autoSelfCast_ = true;
     bool autoSellGrey_ = false;
     bool autoRepair_ = false;
@@ -4620,6 +4682,7 @@ private:
     // Faction hostility lookup (populated from FactionTemplate.dbc)
     std::unordered_map<uint32_t, bool> factionHostileMap_;
     std::unordered_map<uint32_t, bool> factionFriendlyMap_;
+    std::unordered_map<uint32_t, uint32_t> factionTemplateRepList_;
 
     // Vehicle (WotLK): non-zero when player is seated in a vehicle
     uint32_t vehicleId_ = 0;
@@ -5095,6 +5158,25 @@ private:
     bool        resurrectHasSickness_ = false;
     bool        resurrectHasTimer_ = true;
     uint64_t    areaSpiritHealerGuid_ = 0;
+    /// The conversation last asked for, until the server answers it.
+    ///
+    /// A server that refuses one says nothing - out of reach, a creature that
+    /// regards the player as Unfriendly, one that is busy - and a refusal
+    /// looked exactly like a click that never happened. Held so a hello with
+    /// no answer can say what it was sent from. See interactWithNpc.
+    struct PendingNpcHello {
+        uint64_t guid = 0;
+        std::string name;
+        std::chrono::steady_clock::time_point sentAt{};
+        float distance = -1.0f;
+        int reaction = 0;
+        uint32_t npcFlags = 0;
+    };
+    PendingNpcHello pendingNpcHello_;
+    /// The server answered a conversation: whatever it said, the hello got
+    /// through. Called from the dispatch for every packet that opens an NPC's
+    /// window.
+    void noteNpcAnswered() { pendingNpcHello_.guid = 0; }
     float       areaSpiritHealerSeconds_ = 0.0f;
 
     // ---- WotLK Calendar: pending invite counter ----

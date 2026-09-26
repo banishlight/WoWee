@@ -11,6 +11,7 @@
 #include "rendering/vk_context.hpp"
 #include "core/application.hpp"
 #include "core/appearance_composer.hpp"
+#include "ui/map_window.hpp"
 #include "addons/addon_manager.hpp"
 #include "core/coordinates.hpp"
 #include "core/input.hpp"
@@ -463,43 +464,17 @@ void GameScreen::updateCharacterTextures(game::Inventory& inventory) {
 // World Map
 // ============================================================
 
-void GameScreen::renderWorldMap(game::GameHandler& gameHandler) {
-    auto& app = core::Application::getInstance();
-    auto* renderer = app.getRenderer();
+// Everything the map shows besides the land: the zone the player is in, what
+// they have explored, their party, flight points, quests, their corpse and the
+// rares nearby. For the in-game map and the second-window one alike, which is
+// why it is on its own - the second window's map is fed every frame it is open,
+// whatever the in-game one is doing.
+void GameScreen::feedWorldMap(game::GameHandler& gameHandler,
+                              rendering::world_map::WorldMapFacade& targetMap,
+                              const std::function<bool(uint32_t)>& questAreaShown) {
+    auto* renderer = core::Application::getInstance().getRenderer();
     if (!renderer) return;
-
-    auto* wm = renderer->getWorldMap();
-    if (!wm) return;
-
-    // Flight master window drives the world map's flight-map (taxi selection)
-    // mode: opening SMSG_SHOWTAXINODES opens the map, activating a flight or
-    // closing the gossip closes it. A user-dismissed map (Escape / X) closes
-    // the flight master window through the onClose handler.
-    // Not while FrameXML is drawing the flight map itself. The legacy taxi
-    // list a few lines up already stands aside for that element; this mode did
-    // not, so talking to a flight master put both on screen at once - TaxiFrame
-    // over this client's own map, each with its own set of pins.
-    const bool taxiWanted = gameHandler.isTaxiWindowOpen() &&
-                            !frameXmlOwns(UiElement::Taxi);
-    if (taxiWanted && !wm->isTaxiMapOpen()) {
-        auto* gh = &gameHandler;
-        wm->openTaxiMap(
-            [gh](uint32_t dest) { return gh->getTaxiRouteTo(dest); },
-            [gh](uint32_t dest) { gh->activateTaxi(dest); },
-            [gh]() { gh->closeTaxi(); });
-    } else if (!taxiWanted && wm->isTaxiMapOpen()) {
-        wm->closeTaxiMap();
-    }
-
-    // Who says the map is wanted depends on who owns it. FrameXML's world map
-    // is a frame it shows and hides, and application.cpp gives this one that
-    // frame's rect while it is visible - so a rect being set is the same
-    // statement as showWorldMap_ is for this client's own window.
-    const bool frameXmlDrivesMap = frameXmlOwns(UiElement::WorldMap);
-    const bool wanted = frameXmlDrivesMap
-        ? (wm->hasFrameRect() || wm->isTaxiMapOpen())
-        : (showWorldMap_ || wm->isTaxiMapOpen());
-    if (!wanted) return;
+    auto* wm = &targetMap;
 
     // Keep map name in sync with minimap's map name
     auto* minimap = renderer->getMinimap();
@@ -676,7 +651,7 @@ void GameScreen::renderWorldMap(game::GameHandler& gameHandler) {
             // objective of that quest gets its own, which is what the real
             // client shades: DrawQuestBlob names a quest, not an objective.
             if (poi.questObjectiveIndex >= 0 && !poi.area.empty() &&
-                gameHandler.isQuestBlobShown(poi.data)) {
+                questAreaShown(poi.data)) {
                 qp.area.reserve(poi.area.size());
                 for (const auto& pt : poi.area) qp.area.emplace_back(pt.first, pt.second);
             }
@@ -753,6 +728,60 @@ void GameScreen::renderWorldMap(game::GameHandler& gameHandler) {
         }
         wm->setRares(std::move(rares));
     }
+
+}
+
+void GameScreen::renderWorldMap(game::GameHandler& gameHandler) {
+    auto& app = core::Application::getInstance();
+    auto* renderer = app.getRenderer();
+    if (!renderer) return;
+
+    // The map on the second window, under its own ImGui context: a setter can
+    // free a texture, and that goes back through the context that made it.
+    if (auto* mapWindow = app.getMapWindow(); mapWindow && mapWindow->map()) {
+        mapWindow->withContext([&] {
+            feedWorldMap(gameHandler, *mapWindow->map(), [mapWindow](uint32_t questId) {
+                return questId != 0 && questId == mapWindow->selectedQuest();
+            });
+        });
+    }
+
+    auto* wm = renderer->getWorldMap();
+    if (!wm) return;
+
+    // Flight master window drives the world map's flight-map (taxi selection)
+    // mode: opening SMSG_SHOWTAXINODES opens the map, activating a flight or
+    // closing the gossip closes it. A user-dismissed map (Escape / X) closes
+    // the flight master window through the onClose handler.
+    // Not while FrameXML is drawing the flight map itself. The legacy taxi
+    // list a few lines up already stands aside for that element; this mode did
+    // not, so talking to a flight master put both on screen at once - TaxiFrame
+    // over this client's own map, each with its own set of pins.
+    const bool taxiWanted = gameHandler.isTaxiWindowOpen() &&
+                            !frameXmlOwns(UiElement::Taxi);
+    if (taxiWanted && !wm->isTaxiMapOpen()) {
+        auto* gh = &gameHandler;
+        wm->openTaxiMap(
+            [gh](uint32_t dest) { return gh->getTaxiRouteTo(dest); },
+            [gh](uint32_t dest) { gh->activateTaxi(dest); },
+            [gh]() { gh->closeTaxi(); });
+    } else if (!taxiWanted && wm->isTaxiMapOpen()) {
+        wm->closeTaxiMap();
+    }
+
+    // Who says the map is wanted depends on who owns it. FrameXML's world map
+    // is a frame it shows and hides, and application.cpp gives this one that
+    // frame's rect while it is visible - so a rect being set is the same
+    // statement as showWorldMap_ is for this client's own window.
+    const bool frameXmlDrivesMap = frameXmlOwns(UiElement::WorldMap);
+    const bool wanted = frameXmlDrivesMap
+        ? (wm->hasFrameRect() || wm->isTaxiMapOpen())
+        : (showWorldMap_ || wm->isTaxiMapOpen());
+    if (!wanted) return;
+
+    feedWorldMap(gameHandler, *wm, [&gameHandler](uint32_t questId) {
+        return gameHandler.isQuestBlobShown(questId);
+    });
 
     glm::vec3 playerPos = renderer->getCharacterPosition();
     float playerYaw = renderer->getCharacterYaw();
@@ -1417,6 +1446,11 @@ void GameScreen::renderNameplates(game::GameHandler& gameHandler) {
             nameColor = isHostile
                 ? IM_COL32(220, 80, 80, A(230))
                 : IM_COL32(102, 153, 255, A(230));
+        } else if (!isHostile && gameHandler.unitReactionToPlayer(*unit) == 3) {
+            // Orange - unfriendly: not attackable, and it will not talk to
+            // the player either. The Kurenai at Telaar, to an Alliance player
+            // who has not yet reached Neutral with them.
+            nameColor = IM_COL32(240, 130, 60, A(230));
         } else {
             nameColor = isHostile
                 ? IM_COL32(220,  80,  80, A(230))   // red  - hostile NPC
@@ -1686,15 +1720,15 @@ void GameScreen::setGamma(float gamma) {
     if (changed) saveSettings();
 }
 
-void GameScreen::takeScreenshot() {
-    auto* renderer = services_.renderer;
-    if (!renderer) return;
+namespace {
 
-    // Build path: ~/.wowee/screenshots/WoWee_YYYYMMDD_HHMMSS.png
+/// ~/.wowee/<folder>/WoWee_YYYYMMDD_HHMMSS.<extension>, the name a screenshot
+/// or a recording is saved under.
+std::string capturePath(const char* folder, const char* extension) {
     const char* home = std::getenv("HOME");
     if (!home) home = std::getenv("USERPROFILE");
     if (!home) home = "/tmp";
-    std::string dir = std::string(home) + "/.wowee/screenshots";
+    std::string dir = std::string(home) + "/.wowee/" + folder;
 
     auto now = std::chrono::system_clock::now();
     auto tt  = std::chrono::system_clock::to_time_t(now);
@@ -1703,11 +1737,69 @@ void GameScreen::takeScreenshot() {
 
     char filename[128];
     std::snprintf(filename, sizeof(filename),
-                  "WoWee_%04d%02d%02d_%02d%02d%02d.png",
+                  "WoWee_%04d%02d%02d_%02d%02d%02d.%s",
                   tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                  tm.tm_hour, tm.tm_min, tm.tm_sec);
+                  tm.tm_hour, tm.tm_min, tm.tm_sec, extension);
+    return dir + "/" + filename;
+}
 
-    std::string path = dir + "/" + filename;
+}  // namespace
+
+void GameScreen::startRecording() {
+    auto* renderer = services_.renderer;
+    if (!renderer || !services_.gameHandler || renderer->isRecording()) return;
+    const std::string path = capturePath("recordings", "mp4");
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+    std::string error;
+    if (renderer->startRecording(path, error)) {
+        recordingPath_ = path;
+        services_.gameHandler->addSystemChatMessage(
+            "Recording to " + path + ". Type /record again to stop.");
+    } else {
+        services_.gameHandler->addSystemChatMessage("Could not start recording: " + error + ".");
+    }
+}
+
+void GameScreen::stopRecording() {
+    auto* renderer = services_.renderer;
+    if (!renderer || !services_.gameHandler || !renderer->isRecording()) return;
+    const auto stats = renderer->stopRecording();
+    const int seconds = static_cast<int>(stats.seconds + 0.5);
+    char length[32];
+    std::snprintf(length, sizeof(length), "%d:%02d", seconds / 60, seconds % 60);
+    std::string message = "Recording saved: " + recordingPath_ + " (" + length;
+    if (!stats.hasAudio) message += ", no sound";
+    if (stats.framesDropped > 0) {
+        message += ", " + std::to_string(stats.framesDropped) + " frames dropped";
+    }
+    services_.gameHandler->addSystemChatMessage(message + ").");
+}
+
+void GameScreen::toggleRecording() {
+    auto* renderer = services_.renderer;
+    if (!renderer) return;
+    if (renderer->isRecording()) {
+        stopRecording();
+    } else {
+        startRecording();
+    }
+}
+
+void GameScreen::reportRecordingFailure() {
+    auto* renderer = services_.renderer;
+    if (!renderer || !services_.gameHandler) return;
+    const std::string failure = renderer->takeRecordingFailure();
+    if (failure.empty()) return;
+    services_.gameHandler->addSystemChatMessage(
+        "Recording stopped: " + failure + ". What was recorded is saved in " + recordingPath_ + ".");
+}
+
+void GameScreen::takeScreenshot() {
+    auto* renderer = services_.renderer;
+    if (!renderer) return;
+
+    const std::string path = capturePath("screenshots", "png");
 
     if (renderer->captureScreenshot(path)) {
         game::MessageChatData sysMsg;

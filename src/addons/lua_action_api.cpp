@@ -20,7 +20,7 @@
 #include "game/pet_action.hpp"
 #include "imgui.h"
 #include <optional>
-#include <SDL2/SDL_keyboard.h>
+#include <SDL3/SDL_keyboard.h>
 
 namespace wowee::addons {
 
@@ -40,7 +40,7 @@ namespace wowee::addons {
 // window puts one there on every left-click - PickupMerchantItem - and buying
 // is what happens when it is dropped into a bag, so without it a left-click at
 // a vendor did nothing at all and only right-click bought.
-enum class CursorType { NONE, SPELL, ITEM, ACTION, MACRO, MERCHANT, MONEY, GUILDBANK };
+enum class CursorType { NONE, SPELL, ITEM, MACRO, MERCHANT, MONEY, GUILDBANK };
 static CursorType s_cursorType = CursorType::NONE;
 static uint32_t   s_cursorId   = 0;    // spellId, itemId, or action slot
 static int        s_cursorSlot = 0;    // source slot for placement
@@ -279,28 +279,7 @@ static int lua_IsActionInRange(lua_State* L) {
         lua_pushnil(L);
         return 1;
     }
-    if (spellId == 0) { return luaReturnNil(L); }
-
-    auto data = gh->getSpellData(spellId);
-    if (data.maxRange <= 0.0f) {
-        // Melee or self-cast spells: no range indicator
-        lua_pushnil(L);
-        return 1;
-    }
-
-    // Need a target to check range against
-    uint64_t targetGuid = gh->getTargetGuid();
-    if (targetGuid == 0) { return luaReturnNil(L); }
-    auto targetEnt = gh->getEntityManager().getEntity(targetGuid);
-    auto playerEnt = gh->getEntityManager().getEntity(gh->getPlayerGuid());
-    if (!targetEnt || !playerEnt) { return luaReturnNil(L); }
-
-    float dx = playerEnt->getX() - targetEnt->getX();
-    float dy = playerEnt->getY() - targetEnt->getY();
-    float dz = playerEnt->getZ() - targetEnt->getZ();
-    float dist = std::sqrt(dx*dx + dy*dy + dz*dz);
-    lua_pushnumber(L, dist <= data.maxRange ? 1 : 0);
-    return 1;
+    return pushSpellRangeAnswer(L, gh, spellId, gh->getTargetGuid());
 }
 
 // GetActionInfo(slot) → actionType, id, subType
@@ -491,10 +470,6 @@ static int lua_GetCursorInfo(lua_State* L) {
             lua_pushstring(L, "item");
             lua_pushnumber(L, s_cursorId);
             return 2;
-        case CursorType::ACTION:
-            lua_pushstring(L, "action");
-            lua_pushnumber(L, s_cursorSlot);
-            return 2;
         case CursorType::MACRO:
             lua_pushstring(L, "macro");
             lua_pushnumber(L, s_cursorId);
@@ -577,10 +552,15 @@ static int lua_PickupAction(lua_State* L) {
 
     if (hadAction) {
         // What was there goes to the cursor, whether this was a swap or a
-        // plain pick-up.
+        // plain pick-up. existing.type is never EMPTY here (hadAction), so
+        // this covers every case - CursorType::ACTION was a dead end lua_
+        // PlaceAction had no branch for, and picking a macro up off the bar
+        // fell to it by default: the macro left its slot, rode the cursor as
+        // an unplaceable "action", and vanished on drop instead of landing
+        // anywhere.
         setCursorType(L, (existing.type == game::ActionBarSlot::SPELL) ? CursorType::SPELL :
                        (existing.type == game::ActionBarSlot::ITEM)  ? CursorType::ITEM :
-                       CursorType::ACTION);
+                       CursorType::MACRO);
         s_cursorId = existing.id;
         s_cursorSlot = slot;
         // Which button, not which slot of which bag - a fourth numbering, and
@@ -603,7 +583,9 @@ static int lua_PickupAction(lua_State* L) {
             wowee::ui::frameXmlSetCursorItem(
                 info ? gh->getItemIconPath(info->displayInfoId) : std::string());
         } else {
-            wowee::ui::frameXmlSetCursorItem(std::string());
+            std::string icon = gh->getMacroIcon(existing.id);
+            if (icon.empty()) icon = "Interface\\Icons\\INV_Misc_QuestionMark";
+            wowee::ui::frameXmlSetCursorItem(icon);
         }
     } else {
         clearCursorItem(L);
@@ -612,20 +594,23 @@ static int lua_PickupAction(lua_State* L) {
 }
 
 // PlaceAction(slot) - places cursor content into an action bar slot
+//
+// A swap, as the real one is: whatever the slot held goes onto the cursor, so
+// a bar can be rearranged by dropping one action on another and then placing
+// the one that came off. This wrote the new action over the old and cleared
+// the cursor, so the action underneath was simply gone - and it is PlaceAction
+// an action button's OnReceiveDrag calls, so every drop onto an occupied
+// button lost what was there.
+//
+// PickupAction while holding something is exactly that swap, so this is it.
+// With nothing placeable held it does nothing, and leaves the cursor alone.
 static int lua_PlaceAction(lua_State* L) {
-    auto* gh = getGameHandler(L);
-    if (!gh) return 0;
-    int slot = static_cast<int>(luaL_checknumber(L, 1));
-    if (slot < 1 || slot > static_cast<int>(gh->getActionBar().size())) return 0;
-    if (s_cursorType == CursorType::SPELL && s_cursorId != 0) {
-        gh->setActionBarSlot(slot - 1, game::ActionBarSlot::SPELL, s_cursorId);
-    } else if (s_cursorType == CursorType::ITEM && s_cursorId != 0) {
-        gh->setActionBarSlot(slot - 1, game::ActionBarSlot::ITEM, s_cursorId);
-    } else if (s_cursorType == CursorType::MACRO && s_cursorId != 0) {
-        gh->setActionBarSlot(slot - 1, game::ActionBarSlot::MACRO, s_cursorId);
-    }
-    clearCursorItem(L);
-    return 0;
+    const bool holding = s_cursorId != 0 &&
+                         (s_cursorType == CursorType::SPELL ||
+                          s_cursorType == CursorType::ITEM ||
+                          s_cursorType == CursorType::MACRO);
+    if (!holding) return 0;
+    return lua_PickupAction(L);
 }
 
 // PickupSpell(bookSlot, bookType) - picks up a spell from the spellbook
@@ -1324,9 +1309,9 @@ static int lua_AutoEquipCursorItem(lua_State* L) {
 // owns the mouse. lua_system_api registers the same three names against
 // SDL_GetModState; these agree with it now instead of racing it, and the
 // duplicate Is*KeyDown bindings that used to live here are gone with them.
-static bool shiftHeld() { return (SDL_GetModState() & KMOD_SHIFT) != 0; }
-static bool ctrlHeld()  { return (SDL_GetModState() & KMOD_CTRL)  != 0; }
-static bool altHeld()   { return (SDL_GetModState() & KMOD_ALT)   != 0; }
+static bool shiftHeld() { return (SDL_GetModState() & SDL_KMOD_SHIFT) != 0; }
+static bool ctrlHeld()  { return (SDL_GetModState() & SDL_KMOD_CTRL)  != 0; }
+static bool altHeld()   { return (SDL_GetModState() & SDL_KMOD_ALT)   != 0; }
 
 
 /// What bindings.xml declares for a modified-click action, or empty.
@@ -1629,25 +1614,18 @@ ImGuiKey imGuiKeyFromWow(const std::string& name) {
     return ImGuiKey_None;
 }
 
-/// Tells the client what a command is bound to now, for the commands it acts
-/// on. Silent for the rest, which are listed and saved but not yet answered.
 /// Hand a binding to the client's own keybinding manager, if it answers that
 /// command at all.
 ///
-/// Two things do not survive this, both worth knowing before chasing either as
-/// a bug.
+/// The interface allows two keys per command and the manager holds one per
+/// action, so what is pushed here is keys[0] - the primary. The second stays
+/// in the Lua map above. Both are kept past the session: SaveBindings writes
+/// the two slots of every command in that map, and LoadBindings reads them
+/// back and pushes the primary here again.
 ///
-/// A second key for one command is accepted, works for the session and is gone
-/// at the next start. The interface allows two per command and this manager
-/// holds one per action, so what is pushed here is keys[0] - the primary - and
-/// the other lives only in the Lua map above, which nothing saves. Setting a
-/// primary does persist: rebinding the bags from B to N writes toggle_bags=N
-/// and comes back as N. Making the second key stick means the manager holding
-/// two, which is a change to what a binding is here rather than a repair.
-///
-/// A binding for a command not in kLiveBindings does not reach the client at
-/// all, and is not saved either. That is the intended half of this: those are
-/// the commands the interface answers for itself.
+/// A binding for a command not in kLiveBindings does not reach the manager at
+/// all. That is intended: those are the commands the interface answers for
+/// itself.
 void pushBindingToClient(const std::string& command, const std::string& key) {
     for (const auto& live : kLiveBindings) {
         if (command != live.command) continue;

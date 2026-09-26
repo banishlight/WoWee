@@ -1,5 +1,7 @@
 #include "job.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <memory>
 
@@ -105,7 +107,12 @@ float Job::progress() const {
     if (stages_.empty()) return 0.0f;
     std::size_t done = 0;
     for (const JobStage& stage : stages_) done += stage.done ? 1 : 0;
-    return static_cast<float>(done) / static_cast<float>(stages_.size());
+    const float whole = 1.0f / static_cast<float>(stages_.size());
+    // Whole stages, plus however far into the one running. Without the
+    // second term the bar sat on a stage boundary for the length of an
+    // extraction - minutes, on a real game - and read as a hang.
+    const float within = std::clamp(stageFraction_.load(), 0.0f, 1.0f) * whole;
+    return static_cast<float>(done) * whole + within;
 }
 
 void Job::run(Profile profile, std::string gameDir, std::string secondDir,
@@ -132,6 +139,9 @@ void Job::run(Profile profile, std::string gameDir, std::string secondDir,
             currentLabel_ = stage.label;
         }
 
+        // Each stage starts from nothing; only extraction ever moves it.
+        stageFraction_.store(0.0f);
+
         say("");
         say("=== [" + std::to_string(i + 1) + "/" + std::to_string(total) + "] " + stage.label);
 
@@ -153,6 +163,27 @@ void Job::run(Profile profile, std::string gameDir, std::string secondDir,
             opts.expansionSubdir = true;
             say("    reading " + gameDir);
             say("    writing " + outputDir + "/expansions/" + step.expansion);
+            // Called from an extraction worker, so it touches the atomic
+            // directly and leaves say() - which takes the lock - to the
+            // occasional line.
+            // Atomic because two workers can be inside this at once: each
+            // value of `done` reaches it on one thread, but neighbouring
+            // values can arrive on different ones at the same moment.
+            auto saidAt = std::make_shared<std::atomic<std::size_t>>(0);
+            opts.onProgress = [this, saidAt](std::size_t done, std::size_t totalFiles) {
+                if (totalFiles == 0) return;
+                stageFraction_.store(static_cast<float>(done) /
+                                     static_cast<float>(totalFiles));
+                // A line every few thousand files: enough that the log is
+                // visibly alive over a long extraction, and rare enough that
+                // it is not itself the cost. The exchange means only the
+                // thread that wins writes the line.
+                std::size_t want = saidAt->load();
+                if (done >= want && saidAt->compare_exchange_strong(want, done + 5000)) {
+                    say("    " + std::to_string(done) + " / " +
+                        std::to_string(totalFiles) + " files");
+                }
+            };
             try {
                 ok = tools::Extractor::run(opts);
             } catch (const std::exception& exc) {
@@ -180,6 +211,18 @@ void Job::run(Profile profile, std::string gameDir, std::string secondDir,
         else if (step.kind == Kind::ImportModels) {
             const std::string expansionDir =
                 (fs::path(outputDir) / "expansions" / profile.expansion).string();
+
+            // What earlier imports left behind, before adding to them.
+            const RepairResult repaired = repairEarlierImports(expansionDir);
+            if (repaired.modelsRepaired > 0 || repaired.leftDrawn > 0) {
+                say("    " + std::to_string(repaired.namesCleared) +
+                    " missing texture names cleared from " +
+                    std::to_string(repaired.modelsRepaired) + " earlier imports that never draw them" +
+                    (repaired.leftDrawn > 0
+                         ? "; " + std::to_string(repaired.leftDrawn) +
+                               " that are drawn were left as they are"
+                         : std::string()));
+            }
 
             std::unique_ptr<ModelSource> source;
             CascStorage storage;
@@ -209,16 +252,36 @@ void Job::run(Profile profile, std::string gameDir, std::string secondDir,
                     total.refusedByGate += part.refusedByGate;
                     total.missingTextures += part.missingTextures;
                     total.missingSkin += part.missingSkin;
+                    total.dressedByTable += part.dressedByTable;
+                    total.tableSkinsBrought += part.tableSkinsBrought;
+                    total.earlierImportsDressed += part.earlierImportsDressed;
+                    total.earlierImportsRemoved += part.earlierImportsRemoved;
+                    total.unusedTexturesCleared += part.unusedTexturesCleared;
                     total.hasEmitters += part.hasEmitters;
                     total.notBetter += part.notBetter;
                 }
                 const std::size_t refused = total.refusedByGate + total.missingTextures +
-                                            total.missingSkin;
+                                            total.missingSkin + total.dressedByTable;
                 say("    took " + std::to_string(total.written) + " models; left " +
                     std::to_string(total.notBetter) + " alone as no better, " +
                     std::to_string(total.hasEmitters) + " that emit particles, " +
                     std::to_string(refused) + " that would not have arrived whole");
-                ok = total.written > 0;
+                if (total.unusedTexturesCleared > 0) {
+                    say("    " + std::to_string(total.unusedTexturesCleared) +
+                        " texture names cleared from models that never draw them");
+                }
+                if (total.tableSkinsBrought > 0) {
+                    say("    " + std::to_string(total.tableSkinsBrought) +
+                        " creature skins brought for the later meshes that wear them");
+                }
+                if (total.earlierImportsDressed > 0 || total.earlierImportsRemoved > 0) {
+                    say("    earlier imports: " + std::to_string(total.earlierImportsDressed) +
+                        " given the skins they were missing, " +
+                        std::to_string(total.earlierImportsRemoved) +
+                        " removed because nothing here can dress them");
+                }
+                ok = total.written > 0 || total.earlierImportsDressed > 0 ||
+                     total.earlierImportsRemoved > 0;
                 if (!ok) say("    nothing here improves on what is already extracted");
             }
         }

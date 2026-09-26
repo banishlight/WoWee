@@ -1385,17 +1385,32 @@ void TerrainManager::workerLoop() {
             // of pulling more tiles.  Each prepared tile can hold hundreds
             // of MB of decoded textures; limiting concurrency here prevents
             // WoWee from consuming all system memory during world load.
+            //
+            // Low memory narrows loading to one tile at a time; it never stops
+            // it. Waiting only helps while a tile is in flight whose
+            // finalization will free something. With none, nothing this client
+            // does will raise the number, and a phone - where Android keeps
+            // little memory free by design - sat at under 15% with every
+            // worker asleep and no terrain at all.
             const auto& memMon = core::MemoryMonitor::getInstance();
-            if (memMon.isSevereMemoryPressure()) {
-                // Severe pressure - don't pull ANY work until main thread
-                // finalizes tiles and frees decoded texture data.
+            const bool severe = memMon.isSevereMemoryPressure();
+            const bool pressure = severe || memMon.isMemoryPressure();
+            const bool inFlight = preparingTiles_ > 0 || !readyQueue.empty();
+            if (pressure && inFlight) {
+                if (!memoryWaitReported_) {
+                    memoryWaitReported_ = true;
+                    LOG_WARNING("Terrain streaming slowed to one tile at a time: ",
+                                memMon.getAvailableRAM() / (1024 * 1024), " MB of ",
+                                memMon.getTotalRAM() / (1024 * 1024), " MB available");
+                }
                 lock.unlock();
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                std::this_thread::sleep_for(std::chrono::milliseconds(severe ? 200 : 50));
                 continue;
             }
-            if (readyQueue.size() >= maxReadyQueueSize_ || memMon.isMemoryPressure()) {
-                // Moderate pressure or ready queue is backing up - sleep briefly
-                // to let the main thread catch up with finalization.
+            if (!pressure) memoryWaitReported_ = false;
+            if (readyQueue.size() >= maxReadyQueueSize_) {
+                // Finalization is behind - sleep briefly to let the main
+                // thread catch up.
                 lock.unlock();
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 continue;
@@ -1405,6 +1420,7 @@ void TerrainManager::workerLoop() {
                 coord = loadQueue.front();
                 loadQueue.pop_front();
                 hasWork = true;
+                ++preparingTiles_;
             }
         }
 
@@ -1412,6 +1428,7 @@ void TerrainManager::workerLoop() {
             auto pending = prepareTile(coord.x, coord.y);
 
             std::lock_guard<std::mutex> lock(queueMutex);
+            --preparingTiles_;
             if (pending) {
                 readyQueue.push(pending);
             } else {
@@ -2151,11 +2168,13 @@ void TerrainManager::generateGroundClutterPlacements(std::shared_ptr<PendingTile
     if (added > 0) {
         static int clutterLogCount = 0;
         if (clutterLogCount < 12) {
-            // At warning, with the counts beside it. Elwynn grass was
-            // reported growing in Hellfire Peninsula, and the two places that
-            // can put it there - a doodad whose model will not load, and the
-            // minimum-per-tile floor below - both report only here.
-            LOG_WARNING("Ground clutter tile [", pending->coord.x, ",", pending->coord.y,
+            // With the counts beside it. Elwynn grass was reported growing in
+            // Hellfire Peninsula, and the two places that can put it there - a
+            // doodad whose model will not load, and the minimum-per-tile floor
+            // below - both report only here. At debug: a tile that got its
+            // clutter is the ordinary case, twelve lines of it every session.
+            // A tile that got none says so at warning, below.
+            LOG_DEBUG("Ground clutter tile [", pending->coord.x, ",", pending->coord.y,
                      "] added=", added, " attempts=", attemptsTotal,
                      " proxyFallback=", proxyFallbackUsed,
                      " fallbackAdded=", fallbackAdded,

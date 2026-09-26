@@ -1,6 +1,8 @@
 #pragma once
 
 #include "core/window.hpp"
+#include "core/frame_pacer.hpp"
+#include <chrono>
 #include "core/gamepad.hpp"
 #include "ui/unit_portrait.hpp"
 #include "ui/widget_renderer.hpp"
@@ -11,6 +13,7 @@
 #include "game/character.hpp"
 #include "game/game_services.hpp"
 #include "pipeline/asset_inventory.hpp"
+#include "core/update_check.hpp"
 #include "pipeline/blp_loader.hpp"
 #include <memory>
 #include <map>
@@ -31,7 +34,7 @@ namespace wowee {
 
 // Forward declarations
 namespace rendering { class Renderer; }
-namespace ui { class UIManager; }
+namespace ui { class UIManager; class MapWindow; }
 namespace auth { class AuthHandler; }
 namespace game { class GameHandler; class World; class ExpansionRegistry; struct ExpansionProfile; }
 namespace pipeline { class AssetManager; class DBCLayout; struct M2Model; struct WMOModel; }
@@ -55,7 +58,11 @@ enum class AppState {
     CHARACTER_CREATION,
     CHARACTER_SELECTION,
     IN_GAME,
-    DISCONNECTED
+    DISCONNECTED,
+    /// Nothing extracted yet, so the asset builder is shown instead of a
+    /// login nobody can get through. Last rather than first because the log
+    /// prints these by number, and inserting one renumbers every old line.
+    FIRST_RUN
 };
 
 class Application {
@@ -97,6 +104,9 @@ public:
 
     // Accessors
     Window* getWindow() { return window.get(); }
+    /// The world map on a window of its own, for a second monitor. Null until
+    /// the setting first opens it; see updateMapWindow.
+    ui::MapWindow* getMapWindow() { return mapWindow_.get(); }
     rendering::Renderer* getRenderer() { return renderer.get(); }
     ui::UIManager* getUIManager() { return uiManager.get(); }
     auth::AuthHandler* getAuthHandler() { return authHandler.get(); }
@@ -109,6 +119,9 @@ public:
     /// What assets were found at startup. Taken once, because it walks the
     /// override tree and no screen should do that while it is being drawn.
     const pipeline::AssetInventory& getAssetInventory() const { return assetInventory_; }
+    /// Whether GitHub has a newer release than this build, asked once at
+    /// startup. The login screen reads it; nothing else needs to.
+    const UpdateCheck& getUpdateCheck() const { return updateCheck_; }
     pipeline::DBCLayout* getDBCLayout() { return dbcLayout_.get(); }
     bool setAssetExpansionOverride(const std::string& id);
     [[nodiscard]] const std::string& getAssetExpansionOverride() const { return assetExpansionOverrideId_; }
@@ -159,6 +172,11 @@ public:
 
 private:
     void update(float deltaTime);
+
+    /// Opens or closes the map window to match its setting, and builds its
+    /// frame. After the game's own interface frame, before the frame is
+    /// submitted: the window draws into the same frame.
+    void updateMapWindow();
 
     /// One frame of being in the world - the largest arm of update()'s state
     /// switch. updateCheckpoint travels by reference because the caller's catch
@@ -212,6 +230,7 @@ private:
     /// What assets were found at startup, so the login screen can say so
     /// rather than every screen finding out separately.
     pipeline::AssetInventory assetInventory_;
+    UpdateCheck updateCheck_;
 
 
     int stageStatFrames_ = 0;
@@ -220,6 +239,9 @@ private:
     /// interface has settled into what it will actually look like.
     static constexpr int kScreenshotFrame = 30;
     int screenshotFrames_ = 0;
+    /// WOWEE_RECORD: a recording from start-up, then quit. See runFrame.
+    int envRecordFrames_ = 0;
+    std::chrono::steady_clock::time_point envRecordStart_{};
 
     void setupUICallbacks();
     void spawnPlayerCharacter();
@@ -238,6 +260,10 @@ private:
     std::unique_ptr<Window> window;
     std::unique_ptr<rendering::Renderer> renderer;
     std::unique_ptr<ui::UIManager> uiManager;
+    std::unique_ptr<ui::MapWindow> mapWindow_;
+    /// A failed open is not retried every frame; switching the setting off
+    /// and on again tries again.
+    bool mapWindowFailed_ = false;
     std::unique_ptr<auth::AuthHandler> authHandler;
     std::unique_ptr<game::GameHandler> gameHandler;
     std::unique_ptr<game::World> world;
@@ -341,8 +367,8 @@ private:
     // Set by the watchdog thread when it detects a stall; runFrame releases
     // the mouse on the main thread, where SDL video calls are allowed.
     std::atomic<bool> watchdogRequestRelease_{false};
-    // When the previous frame started, for the next frame's delta time.
-    std::chrono::high_resolution_clock::time_point lastFrameTime_{};
+    // Frame delta and cap, kept across runFrame calls.
+    FramePacer pacer_;
 
     AppState state = AppState::AUTHENTICATION;
     bool running = false;
@@ -396,6 +422,7 @@ private:
     // Quest marker billboard sprites (above NPCs)
     void loadQuestMarkerModels();  // Now loads BLP textures
     void updateQuestMarkers();     // Updates billboard positions
+    void updateLootSparkles();     // The glitter over corpses with loot
 };
 
 } // namespace core

@@ -1,4 +1,6 @@
 #include "game/game_handler.hpp"
+#include "game/reputation_standing.hpp"
+#include "addons/lua_api_registrations.hpp"
 #include "game/spell_description_eval.hpp"
 #include "game/gather_spells.hpp"
 #include "game/packed_time.hpp"
@@ -2187,6 +2189,10 @@ void GameHandler::confirmBinder() {
              std::hex, binderGuid_, std::dec);
 }
 
+void GameHandler::setFlightAirborne(bool airborne) {
+    if (movementHandler_) movementHandler_->setFlightAirborne(airborne);
+}
+
 void GameHandler::dismount() {
     if (movementHandler_) movementHandler_->dismount();
 }
@@ -2823,11 +2829,40 @@ void GameHandler::interactWithNpc(uint64_t guid) {
                           " has no NPC flags; no gossip hello sent");
                 return;
             }
+            // Sent anyway - the server is the judge - but said, because the
+            // server says nothing: an NPC whose faction regards the player as
+            // Unfriendly or worse is refused the conversation in silence.
+            if (const int reaction = unitReactionToPlayer(*unit); reaction <= 3) {
+                static std::unordered_set<uint64_t> said;
+                if (said.insert(guid).second) {
+                    LOG_WARNING("interactWithNpc: ", unit->getName(), " (faction template ",
+                                unit->getFactionTemplate(), ") regards you as ",
+                                kReputationStandings[std::max(reaction, 1) - 1].name,
+                                " - the server will not talk to you below Neutral");
+                }
+            }
         }
     }
 
     auto packet = GossipHelloPacket::build(guid);
     socket->send(packet);
+
+    pendingNpcHello_ = PendingNpcHello{};
+    pendingNpcHello_.guid = guid;
+    pendingNpcHello_.sentAt = std::chrono::steady_clock::now();
+    if (auto entity = getEntityManager().getEntity(guid)) {
+        const float dx = movementInfo.x - entity->getX();
+        const float dy = movementInfo.y - entity->getY();
+        const float dz = movementInfo.z - entity->getZ();
+        pendingNpcHello_.distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (auto* unit = dynamic_cast<Unit*>(entity.get())) {
+            pendingNpcHello_.name = unit->getName();
+            pendingNpcHello_.reaction = unitReactionToPlayer(*unit);
+            pendingNpcHello_.npcFlags = unit->getNpcFlags();
+        }
+    }
+    LOG_DEBUG("interactWithNpc: hello to ", pendingNpcHello_.name, " at ",
+              pendingNpcHello_.distance, " yards");
 }
 
 void GameHandler::queryAreaSpiritHealer(uint64_t guid) {
@@ -2863,6 +2898,16 @@ void GameHandler::interactWithGameObject(uint64_t guid) {
         LOG_DEBUG("[GO-DIAG] BLOCKED: already casting spellId=", spellHandler_->getCurrentCastSpellId());
         return;
     }
+    // In the air, a click is not an order to get off. A node or a chest
+    // clicked by accident from a flying mount dismounted the player there and
+    // then, and they fell out of the sky. The same rule casting follows: with
+    // Auto Dismount in Flight off - the default - it is refused, and the
+    // player stays up.
+    if (isMounted() && !isTaxiMountActive() && isPlayerFlying() &&
+        addons::storedCVarValue("autoDismountFlying", "0") == "0") {
+        addUIError("You can't do that while flying.");
+        return;
+    }
     // Always clear melee intent before GO interactions.
     stopAutoAttack();
     // And get off the mount. Opening a chest, gathering a node or using very
@@ -2870,11 +2915,25 @@ void GameHandler::interactWithGameObject(uint64_t guid) {
     // through it both looks wrong and leaves the server refusing the actions
     // that check for it.
     //
+    // Only for something within reach. The server lets an object be used from
+    // five yards or so - ten for a few kinds - and refuses anything further,
+    // so a click on one across the valley cost the mount and did nothing.
+    //
     // Not on a taxi: the flight's mount is not the player's to dismiss, and
     // there is nothing to interact with mid-flight anyway.
     if (isMounted() && !isTaxiMountActive()) {
-        LOG_DEBUG("[GO-DIAG] dismounting before interacting");
-        dismount();
+        constexpr float kGameObjectReach = 12.0f;
+        bool inReach = true;
+        if (auto entity = getEntityManager().getEntity(guid)) {
+            const float dx = movementInfo.x - entity->getX();
+            const float dy = movementInfo.y - entity->getY();
+            const float dz = movementInfo.z - entity->getZ();
+            inReach = dx * dx + dy * dy + dz * dz <= kGameObjectReach * kGameObjectReach;
+        }
+        if (inReach) {
+            LOG_DEBUG("[GO-DIAG] dismounting before interacting");
+            dismount();
+        }
     }
     // Set the pending GO guid so that:
     // 1. cancelCast() won't send CMSG_CANCEL_CAST for GO-triggered casts

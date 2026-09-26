@@ -6,7 +6,7 @@
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
 #include <VkBootstrap.h>
-#include <SDL2/SDL.h>
+#include <SDL3/SDL.h>
 #include <vector>
 #include <functional>
 #include <cstdint>
@@ -89,6 +89,30 @@ public:
     VkCommandBuffer beginFrame(uint32_t& imageIndex);
     void endFrame(VkCommandBuffer cmd, uint32_t imageIndex);
 
+    /// A second window presented by this frame, recorded into its command buffer.
+    ///
+    /// The frame is one submit and one fence, and everything that is ringed per
+    /// frame - deferred destruction, per-frame descriptor sets, query pools -
+    /// relies on that. A second window drawn into the same command buffer is
+    /// covered by the same fence, so none of it needs to know the window is
+    /// there: the submit waits on its image as well as the main one, signals
+    /// its semaphore as well, and endFrame presents it after the main image.
+    /// Valid for the frame it is added in; endFrame consumes it.
+    struct ExtraPresent {
+        VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+        uint32_t imageIndex = 0;
+        VkSemaphore acquired = VK_NULL_HANDLE;   ///< signalled by its acquire
+        VkSemaphore rendered = VK_NULL_HANDLE;   ///< signalled by the submit
+        /// What the present answered, or VK_NOT_READY when the frame's submit
+        /// failed and it was never presented.
+        std::function<void(VkResult)> onResult;
+    };
+    void addExtraPresent(ExtraPresent present);
+    /// Counts resetFrameSyncState calls. A window with semaphores of its own
+    /// remakes them when this moves: the reset exists because a failed submit
+    /// leaves semaphores signalled, and that is true of every window's.
+    [[nodiscard]] uint64_t syncResetGeneration() const { return syncResetGeneration_; }
+
     // Single-time command buffer helpers
     VkCommandBuffer beginSingleTimeCommands();
     void endSingleTimeCommands(VkCommandBuffer cmd);
@@ -136,6 +160,8 @@ public:
     [[nodiscard]] bool isNvidiaGpu() const { return gpuVendorId_ == 0x10DE; }
     [[nodiscard]] VkQueue getGraphicsQueue() const { return graphicsQueue; }
     [[nodiscard]] uint32_t getGraphicsQueueFamily() const { return graphicsQueueFamily; }
+    /// The family every present goes to, a second window's included.
+    [[nodiscard]] uint32_t getPresentQueueFamily() const { return presentQueueFamily; }
 
     // ---- GPU timing ------------------------------------------------------
     //
@@ -170,6 +196,10 @@ public:
     /// during the load surfaced a frame later as the frame's own submit.
     VkResult waitIdle(const char* where);
     [[nodiscard]] bool robustBufferAccessEnabled() const { return robustBufferAccessSupported_; }
+    /// Acceleration structures, ray queries and buffer device addresses are all
+    /// enabled. False on MoltenVK, which exposes none of them; the ray traced
+    /// lighting then uses its compute-shader tracer instead.
+    [[nodiscard]] bool hardwareRayQueryEnabled() const { return hardwareRayQuery_; }
     /// The last completed frame's marks, as (label, milliseconds since the
     /// previous mark). Empty until a frame has come round and been read back.
     [[nodiscard]] const std::vector<std::pair<const char*, double>>&
@@ -258,6 +288,20 @@ public:
     /// Whether barriers can be recorded as VkDependencyInfo. False means the
     /// same barriers still record, through the legacy entry point.
     [[nodiscard]] bool isSynchronization2Supported() const { return synchronization2Supported_; }
+    /// Whether passes may be recorded with vkCmdBeginRendering rather than a
+    /// VkRenderPass. Core at the 1.3 this build requires, so false here means
+    /// a driver that reports a version it does not implement.
+    [[nodiscard]] bool isDynamicRenderingSupported() const { return dynamicRenderingSupported_; }
+    /// Whether the passes that have been converted should actually record
+    /// with vkCmdBeginRendering this run.
+    ///
+    /// Support is not the whole question: WOWEE_VK_NO_DYNAMIC_RENDERING=1
+    /// keeps them on their render passes, which is how the two are compared
+    /// on a driver that renders one of them wrong. Both halves of a pass have
+    /// to ask this and agree - a pipeline built against a VkRenderPass cannot
+    /// be bound inside a vkCmdBeginRendering scope, and the reverse is just
+    /// as invalid - so it is one answer rather than a decision made twice.
+    [[nodiscard]] bool useDynamicRendering() const;
     [[nodiscard]] PFN_vkCmdPipelineBarrier2KHR cmdPipelineBarrier2Fn() const { return cmdPipelineBarrier2_; }
 
     /// Whether a texture can be uploaded without a staging buffer.
@@ -369,10 +413,15 @@ private:
     bool surfaceLost_ = false;
     bool deviceLost_ = false;
     bool vsync_ = true;
+    /// The vsync state the present-mode line last reported, so a rebuild
+    /// that changes nothing says nothing. -1 until the first swapchain.
+    int loggedPresentVsync_ = -1;
 
     // Per-frame resources
     FrameData frames[MAX_FRAMES_IN_FLIGHT];
     uint32_t currentFrame = 0;
+    std::vector<ExtraPresent> extraPresents_;
+    uint64_t syncResetGeneration_ = 0;
 
     /// One timeline semaphore across the whole frame ring, replacing the
     /// per-slot fences. VK_NULL_HANDLE when the device did not offer
@@ -392,9 +441,8 @@ private:
     /// cmdPipelineBarrier2() in vk_utils, which lowers the dependency info
     /// back to a legacy vkCmdPipelineBarrier when this is false.
     bool synchronization2Supported_ = false;
+    bool dynamicRenderingSupported_ = false;
     /// Whether it came from core 1.3 rather than the extension. Decides which
-    /// entry point name resolves - the promoted one is not loadable on 1.2.
-    bool sync2IsCore_ = false;
     PFN_vkCmdPipelineBarrier2KHR cmdPipelineBarrier2_ = nullptr;
 
     /// VK_EXT_host_image_copy. When present, pixels go from host memory into
@@ -420,6 +468,7 @@ private:
     /// and what address it touched when it died.
     bool deviceFaultSupported_ = false;
     bool checkpointsSupported_ = false;
+    bool hardwareRayQuery_ = false;
 #if defined(VK_EXT_device_fault)
     PFN_vkGetDeviceFaultInfoEXT getDeviceFaultInfo_ = nullptr;
 #endif

@@ -3,14 +3,13 @@
 #include <thread>
 #include <mutex>
 #include "rendering/vk_context.hpp"
-#include "platform/drawable_size.hpp"
 
 #include <fstream>
 #include "rendering/vk_utils.hpp"
 #include "core/logger.hpp"
 #include "pipeline/blp_loader.hpp"
 #include <VkBootstrap.h>
-#include <SDL2/SDL_vulkan.h>
+#include <SDL3/SDL_vulkan.h>
 #include <imgui_impl_vulkan.h>
 #include <algorithm>
 #include <cstring>
@@ -94,7 +93,7 @@ bool VkContext::initialize(SDL_Window* window) {
     createPipelineCache();
 
     int w, h;
-    platform::drawableSize(window, &w, &h);
+    SDL_GetWindowSizeInPixels(window, &w, &h);
     if (!createSwapchain(w, h)) return false;
 
     if (!createCommandPools()) return false;
@@ -376,30 +375,44 @@ VkSampler VkContext::getOrCreateSampler(const VkSamplerCreateInfo& info) {
     return sampler;
 }
 
-bool VkContext::createInstance(SDL_Window* window) {
+// The window is no longer needed to ask which instance extensions SDL
+// wants - SDL3 answers for the process - but the signature is this class's
+// own and its caller has the window to hand either way.
+bool VkContext::createInstance([[maybe_unused]] SDL_Window* window) {
 #ifdef __EMSCRIPTEN__
     // The browser: SDL has no Vulkan here, and vkGetInstanceProcAddr is the
     // WebGPU translation layer's, linked in rather than loaded. The canvas is
     // a "headless" surface - the one surface extension that asks nothing of
     // the window system - so vk-bootstrap is told not to look for another.
-    (void)window;
     std::vector<const char*> sdlExts = {VK_KHR_SURFACE_EXTENSION_NAME,
                                         VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME};
     vkb::InstanceBuilder builder{vkGetInstanceProcAddr};
     builder.set_headless(true);
+    // The WebGPU layer is 1.2: legacy barriers, no dynamic rendering.
+    constexpr uint32_t vkMinor = 2;
 #else
     // Get required SDL extensions
     unsigned int sdlExtCount = 0;
-    SDL_Vulkan_GetInstanceExtensions(window, &sdlExtCount, nullptr);
-    std::vector<const char*> sdlExts(sdlExtCount);
-    SDL_Vulkan_GetInstanceExtensions(window, &sdlExtCount, sdlExts.data());
+    // SDL3 hands back its own array rather than filling one in two passes,
+    // and the list is not per window any more.
+    const char* const* sdlExtNames = SDL_Vulkan_GetInstanceExtensions(&sdlExtCount);
+    std::vector<const char*> sdlExts(sdlExtNames, sdlExtNames + sdlExtCount);
 
     vkb::InstanceBuilder builder;
+    constexpr uint32_t vkMinor = 3;
 #endif
     builder.set_app_name("Wowee")
            .set_app_version(VK_MAKE_VERSION(1, 0, 0))
-           .require_api_version(1, 2, 0)
-           .set_minimum_instance_version(1, 1, 0);
+           // 1.3, which is what synchronization2 and dynamic rendering are
+           // core in. The floor was 1.2 because MoltenVK advertised 1.2 with
+           // the extensions bolted on, and requiring 1.3 would have dropped
+           // the platform this is developed on; MoltenVK reports 1.3 now, so
+           // that reason has expired. The cost is hardware that reports only
+           // 1.2 - old Mesa, pre-13 Android, old vendor drivers on Windows -
+           // which no longer starts, and is told why by
+           // reportUnsuitableDevices.
+           .require_api_version(1, vkMinor, 0)
+           .set_minimum_instance_version(1, vkMinor, 0);
 
     for (auto ext : sdlExts) {
         builder.enable_extension(ext);
@@ -466,7 +479,8 @@ bool VkContext::createSurface(SDL_Window* window) {
     }
     return true;
 #endif
-    if (!SDL_Vulkan_CreateSurface(window, instance, &surface)) {
+    // SDL3 takes a host allocator here; nullptr keeps Vulkan's own.
+    if (!SDL_Vulkan_CreateSurface(window, instance, nullptr, &surface)) {
         LOG_ERROR("Failed to create Vulkan surface: ", SDL_GetError());
         return false;
     }
@@ -670,17 +684,30 @@ bool VkContext::selectPhysicalDevice() {
     return true;
 }
 
+bool VkContext::useDynamicRendering() const {
+    // WOWEE_VK_NO_DYNAMIC_RENDERING=1 keeps the converted passes on their
+    // VkRenderPass, the way WOWEE_VK_NO_UPLOAD_BATCH keeps uploads off the
+    // batch path. Read once: this is asked per pipeline build and once per
+    // pass per frame, and an answer that could change between the two would
+    // be a pipeline bound in the wrong kind of scope.
+    static const bool disabled = [] {
+        const char* v = std::getenv("WOWEE_VK_NO_DYNAMIC_RENDERING");
+        return v && *v && *v != '0';
+    }();
+    return dynamicRenderingSupported_ && !disabled;
+}
+
 bool VkContext::createLogicalDevice() {
     // Every enable_extension_if_present has to happen before this line.
     // vkb::DeviceBuilder takes the physical device by value, so a call made
     // after it is constructed changes vkbPhysicalDevice_ and not the copy the
     // builder creates the device from. That is how synchronization2 came to
     // log as enabled while vkCmdPipelineBarrier2KHR would not resolve.
-    sync2IsCore_ = (deviceApiVersion_ >= VK_API_VERSION_1_3 &&
-                    instanceApiVersion_ >= VK_API_VERSION_1_3);
-    const bool sync2Available =
-        sync2IsCore_ || vkbPhysicalDevice_.enable_extension_if_present(
-                            VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+    // Device selection already refused anything below 1.3, so this is a
+    // check on a driver that answered one version and behaves like another
+    // rather than a branch the build expects to take.
+    const bool sync2Available = deviceApiVersion_ >= VK_API_VERSION_1_3 &&
+                                instanceApiVersion_ >= VK_API_VERSION_1_3;
     const bool amdCoherentAvailable = vkbPhysicalDevice_.enable_extension_if_present(
         VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME);
     // VK_EXT_host_image_copy. Lets pixels go straight into an image from host
@@ -710,6 +737,46 @@ bool VkContext::createLogicalDevice() {
         vkbPhysicalDevice_.enable_extension_if_present(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
     checkpointsSupported_ = vkbPhysicalDevice_.enable_extension_if_present(
         VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+
+    // Hardware ray queries for the ray traced lighting. All three extensions
+    // and both features, or none: the lighting falls back to its compute
+    // tracer, which needs nothing beyond storage buffers. The features are
+    // asked before any extension is enabled so a device that lists the
+    // extensions but not the features does not end up with them half on.
+    // WOWEE_RT_FORCE_SOFTWARE keeps them off on hardware that has them, which
+    // is how the fallback is exercised on such a machine.
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR asFeatures{};
+    asFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+    VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{};
+    rayQueryFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+    {
+        const bool forceSoftware = std::getenv("WOWEE_RT_FORCE_SOFTWARE") != nullptr;
+        const bool listed =
+            vkbPhysicalDevice_.is_extension_present(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+            vkbPhysicalDevice_.is_extension_present(VK_KHR_RAY_QUERY_EXTENSION_NAME) &&
+            vkbPhysicalDevice_.is_extension_present(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+        if (listed && !forceSoftware && instanceApiVersion_ >= VK_API_VERSION_1_2) {
+            VkPhysicalDeviceVulkan12Features f12{};
+            f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+            asFeatures.pNext = &rayQueryFeatures;
+            f12.pNext = &asFeatures;
+            VkPhysicalDeviceFeatures2 f2{};
+            f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            f2.pNext = &f12;
+            vkGetPhysicalDeviceFeatures2(physicalDevice, &f2);
+            hardwareRayQuery_ = f12.bufferDeviceAddress && asFeatures.accelerationStructure &&
+                                rayQueryFeatures.rayQuery;
+        }
+        if (hardwareRayQuery_) {
+            vkbPhysicalDevice_.enable_extension_if_present(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+            vkbPhysicalDevice_.enable_extension_if_present(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+            vkbPhysicalDevice_.enable_extension_if_present(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+        }
+        LOG_INFO("Ray traced lighting: ",
+                 hardwareRayQuery_ ? "hardware ray queries"
+                 : forceSoftware   ? "compute tracer (WOWEE_RT_FORCE_SOFTWARE)"
+                                   : "compute tracer (no hardware ray queries)");
+    }
 
     vkb::DeviceBuilder deviceBuilder{vkbPhysicalDevice_};
 
@@ -765,25 +832,65 @@ bool VkContext::createLogicalDevice() {
         }
         // Add each struct separately - vk-bootstrap owns the pNext chaining;
         // manually linking them would be overwritten when it appends the next.
+        if (hardwareRayQuery_) enabled12.bufferDeviceAddress = VK_TRUE;
         deviceBuilder.add_pNext(&enabled11);
         deviceBuilder.add_pNext(&enabled12);
     }
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR enabledAs{};
+    enabledAs.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+    VkPhysicalDeviceRayQueryFeaturesKHR enabledRayQuery{};
+    enabledRayQuery.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+    if (hardwareRayQuery_) {
+        enabledAs.accelerationStructure = VK_TRUE;
+        enabledRayQuery.rayQuery = VK_TRUE;
+        deviceBuilder.add_pNext(&enabledAs);
+        deviceBuilder.add_pNext(&enabledRayQuery);
+    }
 
-    // VK_KHR_synchronization2, taken when the device offers it and skipped
-    // when it does not. Core in Vulkan 1.3, but MoltenVK advertises 1.2 with
-    // the extension present, so requiring 1.3 would drop the platform this is
-    // developed on for a feature it actually has.
-    // Two ways in, because a 1.3 device has it in core and need not advertise
-    // the extension string at all, while a 1.2 device only has the extension.
-    // Checking one and not the other would take the legacy path on hardware
-    // that supports it natively.
+    // synchronization2, which is core at the 1.3 this build now requires -
+    // so there is no extension to ask for and no legacy device to ask it of.
+    // The feature still has to be enabled explicitly, and the entry point is
+    // still checked for below, because a driver advertising a version is not
+    // the same as one that resolves every symbol in it.
+    // Dynamic rendering, core at 1.3 like synchronization2 above. Asked for
+    // here so the passes converted to it have the feature on; a pass still
+    // using vkCmdBeginRenderPass is unaffected either way, so this can be
+    // enabled before anything uses it.
+    //
+    // It is also what multiview stereo would be built on - VkRenderingInfo
+    // carries the viewMask - so this is the first step of that rather than a
+    // saving in its own right.
+    VkPhysicalDeviceDynamicRenderingFeatures dynamicRenderingFeatures{};
+    dynamicRenderingFeatures.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES;
+    {
+        VkPhysicalDeviceDynamicRenderingFeatures supported{};
+        supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES;
+        VkPhysicalDeviceFeatures2 probe{};
+        probe.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        probe.pNext = &supported;
+        vkGetPhysicalDeviceFeatures2(physicalDevice, &probe);
+        if (supported.dynamicRendering) {
+            dynamicRenderingFeatures.dynamicRendering = VK_TRUE;
+            deviceBuilder.add_pNext(&dynamicRenderingFeatures);
+            dynamicRenderingSupported_ = true;
+            LOG_INFO("Enabling dynamic rendering (core 1.3)");
+        } else {
+            // A 1.3 device is required, so this means a driver that reports a
+            // version it does not implement. Worth a line rather than a
+            // silent fall back to render passes.
+            LOG_WARNING("Device reports 1.3 but not dynamicRendering - "
+                        "keeping render passes");
+        }
+    }
+
     VkPhysicalDeviceSynchronization2FeaturesKHR sync2Features{};
     sync2Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR;
     if (sync2Available) {
         sync2Features.synchronization2 = VK_TRUE;
         deviceBuilder.add_pNext(&sync2Features);
         synchronization2Supported_ = true;
-        LOG_INFO("Enabling synchronization2 (", sync2IsCore_ ? "core 1.3" : "KHR extension", ")");
+        LOG_INFO("Enabling synchronization2 (core 1.3)");
     } else {
         LOG_INFO("synchronization2 not available - barriers use the legacy entry point");
     }
@@ -875,19 +982,18 @@ bool VkContext::createLogicalDevice() {
     auto vkbDevice = devRet.value();
     device = vkbDevice.device;
 
-    // Resolved once here rather than per barrier. The KHR entry point is the
-    // one to ask for: on a 1.2 instance the promoted vkCmdPipelineBarrier2
-    // name is not loadable even when the extension is present.
+    // Resolved once here rather than per barrier. The core name, since the
+    // instance is 1.3: the KHR alias was needed only while a 1.2 instance
+    // might have the extension without the promoted symbol.
     if (synchronization2Supported_) {
-        cmdPipelineBarrier2_ = reinterpret_cast<PFN_vkCmdPipelineBarrier2KHR>(
-            vkGetDeviceProcAddr(device,
-                sync2IsCore_ ? "vkCmdPipelineBarrier2" : "vkCmdPipelineBarrier2KHR"));
+        cmdPipelineBarrier2_ = reinterpret_cast<PFN_vkCmdPipelineBarrier2>(
+            vkGetDeviceProcAddr(device, "vkCmdPipelineBarrier2"));
         if (cmdPipelineBarrier2_ == nullptr) {
             // Advertised but not loadable. Nothing to do but take the legacy
             // path, which every barrier already falls back to.
             synchronization2Supported_ = false;
-            LOG_WARNING("VK_KHR_synchronization2 enabled but vkCmdPipelineBarrier2KHR "
-                        "did not resolve - using the legacy entry point");
+            LOG_WARNING("synchronization2 enabled but vkCmdPipelineBarrier2 did "
+                        "not resolve - using the legacy entry point");
         }
     }
     setPipelineBarrier2Fn(cmdPipelineBarrier2_);
@@ -989,6 +1095,8 @@ bool VkContext::createAllocator() {
     const uint32_t vmaCeiling = VK_MAKE_API_VERSION(
         0, VMA_VULKAN_VERSION / 1000000, (VMA_VULKAN_VERSION / 1000) % 1000, 0);
     allocInfo.vulkanApiVersion = std::min(instanceApiVersion_, vmaCeiling);
+    // Acceleration structure builds take their inputs by device address.
+    if (hardwareRayQuery_) allocInfo.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
     if (instanceApiVersion_ > vmaCeiling) {
         LOG_INFO("Instance is Vulkan ", VK_VERSION_MAJOR(instanceApiVersion_), ".",
                  VK_VERSION_MINOR(instanceApiVersion_), " but VMA was built for ",
@@ -1162,6 +1270,16 @@ bool VkContext::createSwapchain(int width, int height) {
         builder.set_desired_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR);
         builder.add_fallback_present_mode(VK_PRESENT_MODE_MAILBOX_KHR);
         builder.add_fallback_present_mode(VK_PRESENT_MODE_FIFO_RELAXED_KHR);
+    }
+
+    // Said when it changes, not on every rebuild: a window being dragged
+    // rebuilds the swapchain repeatedly and this would bury the log. A
+    // present mode is the difference between a frame rate held at the
+    // refresh and one that runs past it, so the changes are worth a line.
+    if (loggedPresentVsync_ != (vsync_ ? 1 : 0)) {
+        loggedPresentVsync_ = vsync_ ? 1 : 0;
+        LOG_WARNING("Swapchain present mode now ",
+                    vsync_ ? "FIFO (vsync on)" : "IMMEDIATE (vsync off)");
     }
 
     auto swapRet = builder.build();
@@ -2538,6 +2656,16 @@ bool VkContext::recreateSwapchain(int width, int height) {
         builder.add_fallback_present_mode(VK_PRESENT_MODE_FIFO_RELAXED_KHR);
     }
 
+    // Said when it changes, not on every rebuild: a window being dragged
+    // rebuilds the swapchain repeatedly and this would bury the log. A
+    // present mode is the difference between a frame rate held at the
+    // refresh and one that runs past it, so the changes are worth a line.
+    if (loggedPresentVsync_ != (vsync_ ? 1 : 0)) {
+        loggedPresentVsync_ = vsync_ ? 1 : 0;
+        LOG_WARNING("Swapchain present mode now ",
+                    vsync_ ? "FIFO (vsync on)" : "IMMEDIATE (vsync off)");
+    }
+
     auto swapRet = builder.build();
 
     if (!swapRet) {
@@ -2606,8 +2734,13 @@ bool VkContext::recreateSwapchain(int width, int height) {
     return true;
 }
 
+void VkContext::addExtraPresent(ExtraPresent present) {
+    extraPresents_.push_back(std::move(present));
+}
+
 void VkContext::resetFrameSyncState() {
     if (device == VK_NULL_HANDLE) return;
+    ++syncResetGeneration_;
     // How many asynchronous upload batches are still outstanding when a
     // rebuild happens. These are submitted without being waited on, one fence
     // each, and FrameXML makes hundreds where this client alone makes almost
@@ -2825,18 +2958,29 @@ void VkContext::endFrame(VkCommandBuffer cmd, uint32_t imageIndex) {
 
     auto& frame = frames[currentFrame];
 
-    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-
     // Use per-image semaphores: acquire semaphore was swapped into the per-image
     // slot in beginFrame; renderFinished is also indexed by the acquired image.
     VkSemaphore& acquireSem = imageAcquiredSemaphores_[imageIndex];
     VkSemaphore& renderSem = renderFinishedSemaphores_[imageIndex];
 
+    // The main image first in every list, then any second window this frame
+    // drew into (see addExtraPresent). One wait and one signal each.
+    std::vector<ExtraPresent> extras;
+    extras.swap(extraPresents_);
+    std::vector<VkSemaphore> waitSemaphores{acquireSem};
+    std::vector<VkPipelineStageFlags> waitStages{VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+    std::vector<VkSemaphore> signalSemaphores{renderSem};
+    for (const ExtraPresent& extra : extras) {
+        waitSemaphores.push_back(extra.acquired);
+        waitStages.push_back(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+        signalSemaphores.push_back(extra.rendered);
+    }
+
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.waitSemaphoreCount = 1;
-    submitInfo.pWaitSemaphores = &acquireSem;
-    submitInfo.pWaitDstStageMask = &waitStage;
+    submitInfo.waitSemaphoreCount = static_cast<uint32_t>(waitSemaphores.size());
+    submitInfo.pWaitSemaphores = waitSemaphores.data();
+    submitInfo.pWaitDstStageMask = waitStages.data();
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &cmd;
 
@@ -2845,25 +2989,22 @@ void VkContext::endFrame(VkCommandBuffer cmd, uint32_t imageIndex) {
     // vkQueuePresentKHR, and the timeline for the CPU wait in beginFrame that
     // used to be a fence. The value paired with a binary semaphore is ignored,
     // but the arrays still have to be the same length.
-    VkSemaphore signalSemaphores[2] = { renderSem, frameTimeline_ };
-    uint64_t signalValues[2] = { 0, 0 };
-    const uint64_t waitValue = 0;
+    std::vector<uint64_t> signalValues(signalSemaphores.size(), 0);
+    const std::vector<uint64_t> waitValues(waitSemaphores.size(), 0);
     VkTimelineSemaphoreSubmitInfo timelineSubmit{};
 
     if (frameTimeline_ != VK_NULL_HANDLE) {
-        signalValues[1] = ++frameTimelineValue_;
+        signalSemaphores.push_back(frameTimeline_);
+        signalValues.push_back(++frameTimelineValue_);
         timelineSubmit.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
-        timelineSubmit.waitSemaphoreValueCount = 1;
-        timelineSubmit.pWaitSemaphoreValues = &waitValue;
-        timelineSubmit.signalSemaphoreValueCount = 2;
-        timelineSubmit.pSignalSemaphoreValues = signalValues;
+        timelineSubmit.waitSemaphoreValueCount = static_cast<uint32_t>(waitValues.size());
+        timelineSubmit.pWaitSemaphoreValues = waitValues.data();
+        timelineSubmit.signalSemaphoreValueCount = static_cast<uint32_t>(signalValues.size());
+        timelineSubmit.pSignalSemaphoreValues = signalValues.data();
         submitInfo.pNext = &timelineSubmit;
-        submitInfo.signalSemaphoreCount = 2;
-        submitInfo.pSignalSemaphores = signalSemaphores;
-    } else {
-        submitInfo.signalSemaphoreCount = 1;
-        submitInfo.pSignalSemaphores = &renderSem;
     }
+    submitInfo.signalSemaphoreCount = static_cast<uint32_t>(signalSemaphores.size());
+    submitInfo.pSignalSemaphores = signalSemaphores.data();
 
     VkResult submitResult = vkQueueSubmit(graphicsQueue, 1, &submitInfo,
                                           frameTimeline_ != VK_NULL_HANDLE ? VK_NULL_HANDLE
@@ -2872,7 +3013,7 @@ void VkContext::endFrame(VkCommandBuffer cmd, uint32_t imageIndex) {
         // Only once the submit is in: on failure the timeline is never
         // signalled, and a slot left waiting on an unreachable value would
         // hang the next beginFrame for its whole timeout instead of failing.
-        frame.timelineValue = signalValues[1];
+        frame.timelineValue = signalValues.back();
     }
     if (submitResult != VK_SUCCESS) {
         LOG_ERROR("endFrame[", endFrameCounter, "] vkQueueSubmit FAILED: ", static_cast<int>(submitResult));
@@ -2908,6 +3049,11 @@ void VkContext::endFrame(VkCommandBuffer cmd, uint32_t imageIndex) {
         // advancing past this one was for.
         resetFrameSyncState();
         swapchainDirty = true;
+        // Never presented, and their semaphores were remade with everyone
+        // else's (see syncResetGeneration).
+        for (const ExtraPresent& extra : extras) {
+            if (extra.onResult) extra.onResult(VK_NOT_READY);
+        }
         return;
     }
 
@@ -2928,6 +3074,21 @@ void VkContext::endFrame(VkCommandBuffer cmd, uint32_t imageIndex) {
     if (result == VK_ERROR_OUT_OF_DATE_KHR ||
         (result == VK_SUBOPTIMAL_KHR && !suboptimalIsExpected)) {
         swapchainDirty = true;
+    }
+
+    // Each on its own, after the main image: one call for several swapchains
+    // answers for each in pResults, but a window that went out of date would
+    // then share a return code with the one that did not.
+    for (const ExtraPresent& extra : extras) {
+        VkPresentInfoKHR extraInfo{};
+        extraInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        extraInfo.waitSemaphoreCount = 1;
+        extraInfo.pWaitSemaphores = &extra.rendered;
+        extraInfo.swapchainCount = 1;
+        extraInfo.pSwapchains = &extra.swapchain;
+        extraInfo.pImageIndices = &extra.imageIndex;
+        const VkResult extraResult = vkQueuePresentKHR(presentQueue, &extraInfo);
+        if (extra.onResult) extra.onResult(extraResult);
     }
 
     currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;

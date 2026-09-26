@@ -329,7 +329,15 @@ void CombatHandler::startAutoAttack(uint64_t targetGuid) {
     // Only dismount once this is a valid attack attempt. Doing it before the
     // target/range gate knocked the player off a mount even though no combat
     // request was sent.
+    //
+    // Never in the air, unless Auto Dismount in Flight asks for it: a hostile
+    // right-clicked from a flying mount dropped the player out of the sky.
     if (owner_.isMounted()) {
+        if (owner_.isPlayerFlying() && !owner_.isTaxiMountActive() &&
+            addons::storedCVarValue("autoDismountFlying", "0") == "0") {
+            owner_.addUIError("You can't do that while flying.");
+            return;
+        }
         owner_.dismount();
     }
 
@@ -342,11 +350,16 @@ void CombatHandler::startAutoAttack(uint64_t targetGuid) {
     autoAttackOutOfRange_ = false;
     autoAttackOutOfRangeTime_ = 0.0f;
     autoAttackResendTimer_ = 0.0f;
-    // Face the target, once, on the command to attack it - the same turn the
-    // real client makes when an attack is ordered on something behind the
-    // player. This is the only place combat turns the player: it used to be
-    // re-aimed every fifth of a second for as long as the attack lasted.
-    if (auto target = owner_.getEntityManager().getEntity(targetGuid)) {
+    // Face the target, once, on the command to attack it. This is the only
+    // place combat turns the player: it used to be re-aimed every fifth of a
+    // second for as long as the attack lasted.
+    //
+    // Only with the Combat page's debug setting on. The original client does
+    // not turn the player at all; attacking something behind them is refused
+    // until they face it themselves.
+    auto target = owner_.isAutoFaceTarget() ? owner_.getEntityManager().getEntity(targetGuid)
+                                            : nullptr;
+    if (target) {
         const float toTargetX = target->getLatestX() - owner_.movementInfoRef().x;
         const float toTargetY = target->getLatestY() - owner_.movementInfoRef().y;
         if (std::abs(toTargetX) > 0.01f || std::abs(toTargetY) > 0.01f) {
